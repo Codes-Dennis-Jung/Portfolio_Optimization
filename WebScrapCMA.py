@@ -96,3 +96,4 @@ def clean_assumptions_data(df):
 
 # Get BlackRock data
 exp_ret = download_blackrock_assumptions()
+exp_ret = exp_ret.set_index(['Asset Class', 'Market', 'Index'])
