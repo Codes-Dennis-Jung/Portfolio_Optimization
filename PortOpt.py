@@ -54,8 +54,8 @@ class OptimizationConstraints:
 class OptimizationMethod(Enum):
     SCIPY = "scipy"
     CVXPY = "cvxpy"
-
 class ObjectiveFunction(Enum):
+    GARLAPPI_ROBUST = "garlappi_robust"
     MINIMUM_VARIANCE = "minimum_variance"
     MEAN_VARIANCE = "mean_variance"
     ROBUST_MEAN_VARIANCE = "robust_mean_variance"
@@ -68,9 +68,115 @@ class ObjectiveFunction(Enum):
     RISK_PARITY = "risk_parity"
     EQUAL_RISK_CONTRIBUTION = "equal_risk_contribution"
     HIERARCHICAL_RISK_PARITY = "hierarchical_risk_parity"
-    
 class PortfolioObjective:
     """Portfolio objective function factory"""
+    
+    @staticmethod
+    def __calculate_estimation_error_covariance(returns: np.ndarray, method: str = 'bayes') -> np.ndarray:
+        """
+        Calculate the covariance matrix of estimation errors (Omega)
+        """
+        T, N = returns.shape
+        
+        if method == 'asymptotic':
+            # Classical approach: Omega = Sigma/T
+            sigma = np.cov(returns, rowvar=False)
+            omega = sigma / T
+            
+        elif method == 'bayes':
+            # Bayesian approach using sample variance
+            mu = np.mean(returns, axis=0)
+            sigma = np.cov(returns, rowvar=False)
+            
+            # Calculate sample variance of mean estimator
+            sample_var = np.zeros((N, N))
+            for t in range(T):
+                dev = (returns[t] - mu).reshape(-1, 1)
+                sample_var += dev @ dev.T
+            
+            # Bayesian posterior covariance
+            omega = sample_var / (T * (T - 1))
+            
+        elif method == 'factor':
+            # Factor-based approach using Principal Components
+            k = min(3, N - 1)  # Number of factors
+            
+            # Perform PCA
+            sigma = np.cov(returns, rowvar=False)
+            eigenvalues, eigenvectors = np.linalg.eigh(sigma)
+            
+            # Sort in descending order
+            idx = np.argsort(eigenvalues)[::-1]
+            eigenvalues = eigenvalues[idx]
+            eigenvectors = eigenvectors[:, idx]
+            
+            # Separate systematic and idiosyncratic components
+            systematic_var = eigenvectors[:, :k] @ np.diag(eigenvalues[:k]) @ eigenvectors[:, :k].T
+            idiosyncratic_var = sigma - systematic_var
+            
+            # Estimation error covariance
+            omega = systematic_var / T + np.diag(np.diag(idiosyncratic_var)) / T
+        
+        else:
+            raise ValueError(f"Unknown method: {method}")
+        
+        # Ensure symmetry and positive definiteness
+        omega = (omega + omega.T) / 2
+        min_eigenval = np.min(np.linalg.eigvals(omega))
+        if min_eigenval < 0:
+            omega += (-min_eigenval + 1e-8) * np.eye(N)
+        
+        return omega
+    
+    @staticmethod
+    def garlappi_robust(returns: np.ndarray, epsilon: float, alpha: np.ndarray,
+                        omega_method: str = 'bayes', omega: Optional[np.ndarray] = None) -> callable:
+        """
+        Implements Garlappi et al. (2007) robust portfolio optimization with asset-specific risk aversion
+        
+        Args:
+            returns: Historical returns matrix (T x N)
+            epsilon: Size of uncertainty region (ε)
+            alpha: Asset-specific risk aversion parameters (N,)
+            omega_method: Method to compute estimation error covariance
+            omega: Optional pre-computed estimation error covariance matrix
+        
+        Returns:
+            Objective function for minimization
+        """
+        # Calculate required inputs
+        mu = np.mean(returns, axis=0)
+        Sigma = np.cov(returns, rowvar=False)
+        
+        # Calculate Omega if not provided
+        if omega is None:
+            Omega = PortfolioObjective._PortfolioObjective__calculate_estimation_error_covariance(
+                returns, method=omega_method
+            )
+        else:
+            Omega = omega
+        
+        def objective(w: np.ndarray) -> float:
+            # Asset-specific risk penalties
+            risk_penalties = np.diag(alpha) @ Sigma
+            variance_penalty = 0.5 * w.T @ risk_penalties @ w
+            
+            # Handle numerical instability in worst-case calculation
+            omega_w_norm = np.sqrt(w.T @ Omega @ w)
+            if omega_w_norm < 1e-8:
+                return np.inf
+            
+            # Worst-case mean adjustment term
+            omega_w = Omega @ w
+            scaling = np.sqrt(epsilon * omega_w_norm)
+            worst_case_mean = mu - scaling * omega_w / omega_w_norm
+            
+            # Complete objective incorporating ambiguity aversion
+            robust_utility = w.T @ worst_case_mean - variance_penalty
+            
+            return -robust_utility  # Negative for minimization
+            
+        return objective
     
     @staticmethod
     def minimum_variance(Sigma: np.ndarray) -> callable:
@@ -84,7 +190,7 @@ class PortfolioObjective:
             risk = np.sqrt(w.T @ Sigma @ w)
             return -mu.T @ w + kappa * risk - epsilon * risk
         return objective
-        
+
     @staticmethod
     def maximum_sharpe(mu: np.ndarray, Sigma: np.ndarray, rf_rate: float = 0.0) -> callable:
         def objective(w: np.ndarray) -> float:
@@ -284,7 +390,7 @@ class HierarchicalRiskParity:
             sort_ix.index = range(sort_ix.shape[0])
             
         return sort_ix.tolist()
-    
+   
 @dataclass
 class GroupConstraint:
     """
@@ -320,7 +426,6 @@ class GroupConstraint:
         """Validate that asset indices are within bounds"""
         if not all(0 <= i < n_assets for i in self.assets):
             raise ValueError(f"Asset indices must be between 0 and {n_assets-1}")
-
 class PortfolioOptimizer:
     def __init__(
         self,
@@ -401,6 +506,17 @@ class PortfolioOptimizer:
         """Get the appropriate objective function"""
         if objective == ObjectiveFunction.MINIMUM_VARIANCE:
             return self.objective_functions.minimum_variance(self.covariance)
+        
+        elif objective == ObjectiveFunction.GARLAPPI_ROBUST:
+            epsilon = kwargs.get('epsilon', 0.1)  # Default uncertainty
+            alpha = kwargs.get('alpha', 1.0)      # Default risk aversion
+            omega_method = kwargs.get('omega_method', 'bayes')
+            return self.objective_functions.garlappi_robust(
+                returns=self.returns.values,
+                epsilon=epsilon,
+                alpha=alpha,
+                omega_method=omega_method
+            )
             
         elif objective == ObjectiveFunction.MEAN_VARIANCE:
             return self.objective_functions.mean_variance(
@@ -586,8 +702,8 @@ class PortfolioOptimizer:
                 obj = cp.Minimize(cp.quad_form(w, self.covariance) - w @ self.expected_returns)
                 
         elif objective == ObjectiveFunction.ROBUST_MEAN_VARIANCE:
-            epsilon = kwargs.get('epsilon', self.uncertainty)
-            kappa = kwargs.get('kappa', self.risk_aversion)
+            epsilon = kwargs.get('epsilon', 0.5)
+            kappa = kwargs.get('kappa', 1.0)
             risk = cp.norm(self.covariance @ w)
             obj = cp.Minimize(-w @ self.expected_returns + kappa * risk - epsilon * risk)
             
@@ -678,6 +794,31 @@ class PortfolioOptimizer:
             marginal_risk = self.covariance @ w / portfolio_risk
             risk_contrib = cp.multiply(w, marginal_risk) / portfolio_risk
             obj = cp.Minimize(cp.sum_squares(risk_contrib - target_risk))
+        
+        elif objective == ObjectiveFunction.GARLAPPI_ROBUST:
+            epsilon = kwargs.get('epsilon', 0.1)
+            alpha = kwargs.get('alpha', 1.0)
+            omega_method = kwargs.get('omega_method', 'bayes')
+            
+            # Calculate required inputs
+            mu = self.expected_returns
+            Sigma = self.covariance
+            
+            # Calculate Omega (estimation error covariance)
+            Omega = self.objective_functions._PortfolioObjective__calculate_estimation_error_covariance(
+                self.returns.values, 
+                method=omega_method
+            )
+            # Regular mean-variance term
+            variance_term = 0.5 * alpha * cp.quad_form(w, Sigma)
+            
+            # Worst-case mean adjustment
+            omega_w_norm = cp.norm(Omega @ w)
+            scaling = cp.sqrt(epsilon * omega_w_norm)
+            worst_case_mean = mu - scaling * (Omega @ w) / omega_w_norm
+            
+            # Complete objective
+            obj = cp.Maximize(w @ worst_case_mean - variance_term)
             
         else:
             raise ValueError(f"Objective function {objective} not implemented for CVXPY")
@@ -774,56 +915,15 @@ class PortfolioOptimizer:
             
         return metrics
 
-def preprocess_covariance(returns: pd.DataFrame, half_life: int = 36) -> np.ndarray:
-    """
-    Compute and regularize the covariance matrix
-    
-    Args:
-        returns: DataFrame of asset returns
-        half_life: Half-life for exponential weighting
-    """
-    # 1. Exponentially weighted covariance
-    lambda_param = np.log(2) / half_life
-    weights = np.exp(-lambda_param * np.arange(len(returns)))
-    weights = weights / np.sum(weights)
-    
-    # Center returns
-    centered_returns = returns - returns.mean()
-    
-    # Compute weighted covariance
-    weighted_returns = centered_returns * np.sqrt(weights[:, np.newaxis])
-    cov = weighted_returns.T @ weighted_returns
-    
-    # 2. Regularization using shrinkage
-    n = len(returns)
-    sample_cov = cov.values
-    target = np.diag(np.diag(sample_cov))  # Diagonal target
-    
-    # Compute optimal shrinkage intensity
-    phi = np.sum((sample_cov - target) ** 2)
-    gamma = np.linalg.norm(sample_cov - target, 'fro')
-    kappa = phi / gamma
-    delta = min(1, kappa / n)
-    
-    # Apply shrinkage
-    shrunk_cov = (1 - delta) * sample_cov + delta * target
-    
-    # 3. Ensure positive definiteness
-    eigenvals = np.linalg.eigvals(shrunk_cov)
-    if min(eigenvals) < 1e-8:
-        min_eig = min(eigenvals)
-        shrunk_cov += (1e-8 - min_eig) * np.eye(len(shrunk_cov))
-    
-    return shrunk_cov
-
 class RobustPortfolioOptimizer(PortfolioOptimizer):
-    """Enhanced portfolio optimizer with robust optimization methods"""
+    """Enhanced portfolio optimizer using Garlappi et al. (2007) robust optimization by default"""
     
     def __init__(
         self, 
         returns: pd.DataFrame, 
-        uncertainty: float = 0.1, 
-        risk_aversion: float = 1.0,
+        epsilon: float = 0.1,
+        alpha: Union[float, np.ndarray] = 1.0,  # Can be scalar or vector
+        omega_method: str = 'bayes',
         optimization_method: OptimizationMethod = OptimizationMethod.SCIPY,
         half_life: int = 36,
         risk_free_rate: float = 0.0,
@@ -831,140 +931,89 @@ class RobustPortfolioOptimizer(PortfolioOptimizer):
     ):
         # Store original returns and parameters
         self.original_returns = returns.copy()
-        self.uncertainty = uncertainty
-        self.risk_aversion = risk_aversion
-        self.half_life = half_life
+        self.epsilon = epsilon
         
-        # Preprocess returns
-        self.processed_returns = self._preprocess_returns(returns)
+        # Handle alpha as vector or scalar
+        if isinstance(alpha, (int, float)):
+            self.alpha = np.full(returns.shape[1], alpha)
+        else:
+            if len(alpha) != returns.shape[1]:
+                raise ValueError(f"Alpha vector length ({len(alpha)}) must match number of assets ({returns.shape[1]})")
+            self.alpha = np.array(alpha)
+            
+        self.omega_method = omega_method
+        self.half_life = half_life
         
         # Initialize parent with processed returns
         super().__init__(
-            returns=self.processed_returns,
+            returns=returns,
             optimization_method=optimization_method,
             half_life=half_life,
             risk_free_rate=risk_free_rate,
             transaction_cost=transaction_cost
         )
-        
-        # Override covariance with robust estimation
-        self.covariance = self._preprocess_covariance()
-        
-    def _preprocess_returns(self, returns: pd.DataFrame) -> pd.DataFrame:
-        """
-        Comprehensive returns preprocessing
-        
-        1. Outlier detection and handling
-        2. Missing value treatment
-        3. Volatility adjustment
-        """
-        processed = returns.copy()
-        
-        # Handle missing values
-        processed = processed.fillna(method='ffill').fillna(method='bfill')
-        
-        # Detect and handle outliers using Winsorization
-        for column in processed.columns:
-            # Calculate robust statistics
-            median = processed[column].median()
-            mad = np.median(np.abs(processed[column] - median))
-            lower_bound = median - 3 * mad
-            upper_bound = median + 3 * mad
-            
-            # Winsorize outliers
-            processed[column] = processed[column].clip(lower=lower_bound, upper=upper_bound)
-        
-        # Volatility adjustment using exponential weighting
-        vol_adj_returns = processed.copy()
-        lambda_param = np.log(2) / self.half_life
-        weights = np.exp(-lambda_param * np.arange(len(processed)))[::-1]
-        weights = weights / np.sum(weights)
-        
-        for column in processed.columns:
-            rolling_vol = np.sqrt(
-                np.sum(weights * (processed[column].values ** 2))
-            )
-            vol_adj_returns[column] = processed[column] / rolling_vol
-            
-        return vol_adj_returns
-    
-    def _preprocess_covariance(self) -> np.ndarray:
-        """
-        Robust covariance matrix estimation
-        
-        1. Exponential weighting
-        2. Shrinkage estimation
-        3. Conditioning improvement
-        4. Positive definiteness enforcement
-        """
-        # 1. Exponentially weighted covariance
-        lambda_param = np.log(2) / self.half_life
-        weights = np.exp(-lambda_param * np.arange(len(self.processed_returns)))[::-1]
-        weights = weights / np.sum(weights)
-        
-        # Center returns
-        centered_returns = self.processed_returns - self.processed_returns.mean()
-        
-        # Compute weighted covariance
-        weighted_returns = centered_returns * np.sqrt(weights[:, np.newaxis])
-        sample_cov = weighted_returns.T @ weighted_returns
-        
-        # 2. Shrinkage estimation
-        n_assets = len(self.processed_returns.columns)
-        sample_cov_values = sample_cov.values
-        
-        # Compute shrinkage target (diagonal matrix)
-        target = np.diag(np.diag(sample_cov_values))
-        
-        # Compute optimal shrinkage intensity
-        phi = np.sum((sample_cov_values - target) ** 2)
-        gamma = np.linalg.norm(sample_cov_values - target, 'fro')
-        kappa = phi / gamma
-        delta = min(1, kappa / n_assets)
-        
-        # Apply shrinkage
-        shrunk_cov = (1 - delta) * sample_cov_values + delta * target
-        
-        # 3. Improve conditioning
-        eigenvals, eigenvecs = np.linalg.eigh(shrunk_cov)
-        
-        # Set minimum eigenvalue threshold
-        min_eigenval = max(1e-8, eigenvals.max() * 1e-6)
-        eigenvals = np.maximum(eigenvals, min_eigenval)
-        
-        # Reconstruct covariance matrix
-        cov_matrix = eigenvecs @ np.diag(eigenvals) @ eigenvecs.T
-        
-        # 4. Ensure symmetry and positive definiteness
-        cov_matrix = (cov_matrix + cov_matrix.T) / 2
-        
-        return cov_matrix
+                
+        # Calculate estimation error covariance (Omega)
+        self.omega = self._calculate_estimation_error_covariance(returns.values,
+            method=self.omega_method
+        )
     
     def optimize(
         self, 
-        objective: ObjectiveFunction, 
-        constraints: OptimizationConstraints,
+        objective: Optional[ObjectiveFunction] = None,
+        constraints: Optional[OptimizationConstraints] = None,
         current_weights: Optional[np.ndarray] = None, 
         **kwargs
     ) -> Dict[str, Union[np.ndarray, float]]:
-        """Enhanced optimize method with multiple attempts and robust fallback"""
+        """Enhanced optimize method with Garlappi as default"""
         if current_weights is None:
             current_weights = np.ones(len(self.returns.columns)) / len(self.returns.columns)
+            
+        if constraints is None:
+            constraints = OptimizationConstraints(long_only=True)
+            
+        # If no objective specified, use Garlappi robust
+        if objective is None:
+            objective = ObjectiveFunction.GARLAPPI_ROBUST
+            kwargs.update({
+                'epsilon': self.epsilon,
+                'alpha': self.alpha,
+                'omega': self.omega
+            })
+        
+        # Force SCIPY for Garlappi optimization
+        if objective == ObjectiveFunction.GARLAPPI_ROBUST:
+            original_method = self.optimization_method
+            self.optimization_method = OptimizationMethod.SCIPY
         
         try:
-            # First attempt with original parameters
-            return super().optimize(objective, constraints, current_weights, **kwargs)
+            # First attempt with specified parameters
+            result = super().optimize(objective, constraints, current_weights, **kwargs)
+            
+            # Restore original optimization method
+            if objective == ObjectiveFunction.GARLAPPI_ROBUST:
+                self.optimization_method = original_method
+                
+            return result
+            
         except ValueError as e:
             print(f"First optimization attempt failed: {e}")
             try:
                 # Second attempt with relaxed constraints
                 relaxed_constraints = self._relax_constraints(constraints)
-                return super().optimize(objective, relaxed_constraints, current_weights, **kwargs)
+                result = super().optimize(objective, relaxed_constraints, current_weights, **kwargs)
+                
+                # Restore original optimization method
+                if objective == ObjectiveFunction.GARLAPPI_ROBUST:
+                    self.optimization_method = original_method
+                    
+                return result
+                
             except ValueError as e:
                 print(f"Second optimization attempt failed: {e}")
-                # Final attempt with robust mean-variance
-                print("Falling back to robust mean-variance optimization...")
-                return self._robust_mean_variance_fallback(current_weights)
+                # Final attempt with Garlappi robust and minimal constraints
+                print("Falling back to Garlappi robust optimization with minimal constraints...")
+                return self._garlappi_robust_fallback(current_weights)
     
     def _relax_constraints(self, constraints: OptimizationConstraints) -> OptimizationConstraints:
         """Relax optimization constraints gradually"""
@@ -995,49 +1044,90 @@ class RobustPortfolioOptimizer(PortfolioOptimizer):
         
         return relaxed
     
-    def _robust_mean_variance_fallback(self, current_weights: np.ndarray) -> Dict[str, Union[np.ndarray, float]]:
-        """Fallback to robust mean-variance optimization with minimal constraints"""
+    def _garlappi_robust_fallback(self, current_weights: np.ndarray) -> Dict[str, Union[np.ndarray, float]]:
+        """Fallback to Garlappi robust optimization with minimal constraints"""
+        original_method = self.optimization_method
+        self.optimization_method = OptimizationMethod.SCIPY
+        
         constraints = OptimizationConstraints(
             long_only=True,
             box_constraints={i: (0, 0.3) for i in range(len(self.returns.columns))}
         )
         
-        result = super().optimize(
-            objective=ObjectiveFunction.ROBUST_MEAN_VARIANCE,
-            constraints=constraints,
-            current_weights=current_weights,
-            epsilon=self.uncertainty,
-            kappa=self.risk_aversion
-        )
-        
+        try:
+            result = super().optimize(
+                objective=ObjectiveFunction.GARLAPPI_ROBUST,
+                constraints=constraints,
+                current_weights=current_weights,
+                epsilon=self.epsilon,
+                alpha=self.alpha,
+                omega=self.omega
+            )
+        finally:
+            # Restore original optimization method
+            self.optimization_method = original_method
+            
         return result
     
-    def calculate_robust_metrics(self, weights: np.ndarray) -> Dict[str, float]:
-        """Calculate additional robust performance metrics"""
-        # Basic metrics
+    def _calculate_estimation_error_covariance(self, returns: np.ndarray, method: str = 'bayes') -> np.ndarray:
+        """Calculate the covariance matrix of estimation errors (Omega)"""
+        return PortfolioObjective._PortfolioObjective__calculate_estimation_error_covariance(
+            returns=returns,
+            method=method
+        )
+    
+    def calculate_robust_metrics(self, weights: np.ndarray, alpha: Optional[np.ndarray] = None) -> Dict[str, float]:
+        """
+        Calculate additional robust performance metrics including Garlappi-specific metrics
+        
+        Args:
+            weights: Portfolio weights
+            alpha: Optional scaled alpha vector (if None, uses self.alpha)
+        """
+        # Use base alpha if no scaled alpha provided
+        if alpha is None:
+            alpha = self.alpha
+            
+        # Basic metrics with asset-specific risk aversion
         portfolio_return = weights @ self.expected_returns
-        portfolio_risk = np.sqrt(weights @ self.covariance @ weights)
+        risk_matrix = np.diag(alpha) @ self.covariance if isinstance(alpha, np.ndarray) else alpha * self.covariance
+        portfolio_risk = np.sqrt(weights.T @ risk_matrix @ weights)
         
-        # Worst-case return
-        worst_case_return = portfolio_return - self.uncertainty * portfolio_risk
+        # Worst-case return using Garlappi framework
+        omega_w = self.omega @ weights
+        omega_w_norm = np.sqrt(weights.T @ self.omega @ weights)
+        if omega_w_norm > 1e-8:
+            scaling = np.sqrt(self.epsilon * omega_w_norm)
+            worst_case_return = portfolio_return - scaling * omega_w_norm
+        else:
+            worst_case_return = portfolio_return
         
-        # Diversification ratio
-        asset_stdevs = np.sqrt(np.diag(self.covariance))
+        # Diversification ratio with risk-adjusted standard deviations
+        asset_stdevs = np.sqrt(np.diag(risk_matrix))
         div_ratio = (weights @ asset_stdevs) / portfolio_risk
         
         # Concentration metrics
         herfindahl = np.sum(weights ** 2)
         effective_n = 1 / herfindahl
         
+        # Parameter uncertainty metrics
+        estimation_uncertainty = np.sqrt(weights.T @ self.omega @ weights)
+        
+        # Asset-specific risk contributions
+        marginal_risk = risk_matrix @ weights / portfolio_risk
+        risk_contributions = weights * marginal_risk
+        
         return {
             'worst_case_return': worst_case_return,
             'diversification_ratio': div_ratio,
             'herfindahl_index': herfindahl,
-            'effective_n': effective_n
+            'effective_n': effective_n,
+            'estimation_uncertainty': estimation_uncertainty,
+            'robust_sharpe': (worst_case_return - self.risk_free_rate) / portfolio_risk,
+            'risk_contributions': risk_contributions
         }
-        
 class RobustEfficientFrontier(RobustPortfolioOptimizer):
-    """Class for computing robust efficient frontier using Robust Mean-Variance optimization"""
+    """Class for computing Garlappi robust efficient frontier with asset-specific risk aversion"""
     
     def __init__(self, returns: pd.DataFrame, **kwargs):
         super().__init__(returns, **kwargs)
@@ -1045,23 +1135,22 @@ class RobustEfficientFrontier(RobustPortfolioOptimizer):
     def compute_efficient_frontier(
         self,
         n_points: int = 15,
+        epsilon_range: Optional[Tuple[float, float]] = None,
         risk_range: Optional[Tuple[float, float]] = None,
-        return_range: Optional[Tuple[float, float]] = None,
+        alpha_scale_range: Optional[Tuple[float, float]] = None,  # Added alpha scaling range
         constraints: Optional[OptimizationConstraints] = None
     ) -> Dict[str, np.ndarray]:
         """
-        Compute the robust efficient frontier
+        Compute the Garlappi robust efficient frontier
         
         Args:
             n_points: Number of points on the frontier
+            epsilon_range: Optional (min_epsilon, max_epsilon) for uncertainty
             risk_range: Optional (min_risk, max_risk) tuple
-            return_range: Optional (min_return, max_return) tuple
+            alpha_scale_range: Optional (min_scale, max_scale) to vary alpha vector
             constraints: Basic constraints for all portfolios
-            
-        Returns:
-            Dictionary containing frontier information
         """
-        print("Computing robust efficient frontier...")
+        print("Computing Garlappi robust efficient frontier...")
         
         # Initialize base constraints if none provided
         if constraints is None:
@@ -1071,9 +1160,13 @@ class RobustEfficientFrontier(RobustPortfolioOptimizer):
         if risk_range is None:
             risk_range = self._get_risk_bounds()
             
-        # Get return range if not provided
-        if return_range is None:
-            return_range = self._get_return_bounds()
+        # Get epsilon range if not provided
+        if epsilon_range is None:
+            epsilon_range = (0.0, 2.0 * self.epsilon)
+            
+        # Get alpha scale range if not provided
+        if alpha_scale_range is None:
+            alpha_scale_range = (0.5, 1.5)  # Default range to scale alpha vector
             
         # Initialize result containers
         frontier_results = {
@@ -1083,24 +1176,34 @@ class RobustEfficientFrontier(RobustPortfolioOptimizer):
             'worst_case_returns': np.zeros(n_points),
             'weights': np.zeros((n_points, len(self.returns.columns))),
             'diversification_ratios': np.zeros(n_points),
-            'effective_n': np.zeros(n_points)
+            'effective_n': np.zeros(n_points),
+            'estimation_uncertainty': np.zeros(n_points),
+            'robust_sharpe_ratios': np.zeros(n_points),
+            'epsilons': np.zeros(n_points),
+            'alpha_scales': np.zeros(n_points),
+            'risk_contributions': np.zeros((n_points, len(self.returns.columns)))
         }
         
-        # Compute frontier points
         for i in tqdm(range(n_points)):
             try:
-                # Interpolate target return
-                target_return = return_range[0] + (return_range[1] - return_range[0]) * i / (n_points - 1)
+                # Interpolate parameters
+                target_epsilon = epsilon_range[0] + (epsilon_range[1] - epsilon_range[0]) * i / (n_points - 1)
+                target_risk = risk_range[0] + (risk_range[1] - risk_range[0]) * i / (n_points - 1)
+                alpha_scale = alpha_scale_range[0] + (alpha_scale_range[1] - alpha_scale_range[0]) * i / (n_points - 1)
                 
-                # Create constraints with target return
-                point_constraints = self._create_frontier_constraints(constraints, target_return)
+                # Scale alpha vector
+                scaled_alpha = self.alpha * alpha_scale
                 
-                # Optimize portfolio
+                # Create constraints with target risk
+                point_constraints = self._create_frontier_constraints(constraints, target_risk)
+                
+                # Optimize portfolio with varying parameters
                 result = self.optimize(
-                    objective=ObjectiveFunction.ROBUST_MEAN_VARIANCE,
+                    objective=ObjectiveFunction.GARLAPPI_ROBUST,
                     constraints=point_constraints,
-                    epsilon=self.uncertainty,
-                    kappa=self.risk_aversion
+                    epsilon=target_epsilon,
+                    alpha=scaled_alpha,  # Use scaled alpha vector
+                    omega=self.omega
                 )
                 
                 # Store results
@@ -1108,12 +1211,17 @@ class RobustEfficientFrontier(RobustPortfolioOptimizer):
                 frontier_results['risks'][i] = result['risk']
                 frontier_results['sharpe_ratios'][i] = result['sharpe_ratio']
                 frontier_results['weights'][i] = result['weights']
+                frontier_results['epsilons'][i] = target_epsilon
+                frontier_results['alpha_scales'][i] = alpha_scale
                 
-                # Calculate and store robust metrics
-                robust_metrics = self.calculate_robust_metrics(result['weights'])
+                # Calculate and store robust metrics with scaled alpha
+                robust_metrics = self.calculate_robust_metrics(result['weights'], scaled_alpha)
                 frontier_results['worst_case_returns'][i] = robust_metrics['worst_case_return']
                 frontier_results['diversification_ratios'][i] = robust_metrics['diversification_ratio']
                 frontier_results['effective_n'][i] = robust_metrics['effective_n']
+                frontier_results['estimation_uncertainty'][i] = robust_metrics['estimation_uncertainty']
+                frontier_results['robust_sharpe_ratios'][i] = robust_metrics['robust_sharpe']
+                frontier_results['risk_contributions'][i] = robust_metrics['risk_contributions']
                 
             except Exception as e:
                 print(f"Failed to compute frontier point {i}: {str(e)}")
@@ -1130,28 +1238,39 @@ class RobustEfficientFrontier(RobustPortfolioOptimizer):
             frontier_results[key] = frontier_results[key][sort_idx]
             
         return frontier_results
-    
+
     def _get_risk_bounds(self) -> Tuple[float, float]:
-        """Compute minimum and maximum risk bounds"""
+        """Compute minimum and maximum risk bounds with asset-specific risk aversion"""
         try:
-            # Minimum risk portfolio
+            # Minimum risk portfolio (global minimum variance)
             min_var_result = self.optimize(
                 objective=ObjectiveFunction.MINIMUM_VARIANCE,
                 constraints=OptimizationConstraints(long_only=True)
             )
             min_risk = min_var_result['risk']
             
-            # Maximum return portfolio for max risk
-            max_return_result = self.optimize(
-                objective=ObjectiveFunction.ROBUST_MEAN_VARIANCE,
+            # Maximum risk portfolio with reduced risk aversion
+            reduced_alpha = self.alpha * 0.5  # Reduce risk aversion for upper bound
+            max_risk_result = self.optimize(
+                objective=ObjectiveFunction.GARLAPPI_ROBUST,
                 constraints=OptimizationConstraints(
                     long_only=True,
                     box_constraints={i: (0, 1) for i in range(len(self.returns.columns))}
                 ),
-                epsilon=0,  # No uncertainty penalty for maximum risk
-                kappa=0    # No risk aversion for maximum risk
+                epsilon=self.epsilon,
+                alpha=reduced_alpha
             )
-            max_risk = max_return_result['risk'] * 1.2  # Add 20% buffer
+            
+            # Use maximum individual asset risk as a reference
+            asset_stds = np.sqrt(np.diag(self.covariance))
+            max_asset_risk = asset_stds.max()
+            
+            # Take the larger of maximum portfolio risk and maximum asset risk
+            max_risk = max(max_risk_result['risk'], max_asset_risk)
+            
+            # Add buffer to risk bounds
+            max_risk *= 1.2  # Add 20% buffer to maximum risk
+            min_risk *= 0.8  # Reduce minimum risk by 20%
             
             return min_risk, max_risk
             
@@ -1159,128 +1278,106 @@ class RobustEfficientFrontier(RobustPortfolioOptimizer):
             print(f"Error computing risk bounds: {str(e)}")
             # Fallback to standard deviation range
             asset_stds = np.sqrt(np.diag(self.covariance))
-            return asset_stds.min(), asset_stds.max() * 2
-    
-    def _get_return_bounds(self) -> Tuple[float, float]:
-        """Compute minimum and maximum return bounds"""
-        try:
-            # Get return range from expected returns
-            min_return = self.expected_returns.min()
-            max_return = self.expected_returns.max()
-            
-            # Add buffer
-            return_range = max_return - min_return
-            min_return -= return_range * 0.1
-            max_return += return_range * 0.1
-            
-            return min_return, max_return
-            
-        except Exception as e:
-            print(f"Error computing return bounds: {str(e)}")
-            return 0, self.expected_returns.max() * 1.2
-    
+            return asset_stds.min() * 0.8, asset_stds.max() * 2
+
     def _create_frontier_constraints(
         self,
         base_constraints: OptimizationConstraints,
-        target_return: float
+        target_risk: float
     ) -> OptimizationConstraints:
-        """Create constraints for frontier point"""
+        """Create constraints for frontier point with target risk"""
         return OptimizationConstraints(
             group_constraints=base_constraints.group_constraints,
             box_constraints=base_constraints.box_constraints,
             long_only=base_constraints.long_only,
             max_turnover=base_constraints.max_turnover,
-            target_return=target_return,
+            target_risk=target_risk,
             max_tracking_error=base_constraints.max_tracking_error,
             benchmark_weights=base_constraints.benchmark_weights
         )
+
+    def calculate_frontier_risk_contributions(self, frontier_results: Dict[str, np.ndarray]) -> pd.DataFrame:
+        """Calculate and analyze risk contributions across the frontier"""
+        n_points, n_assets = frontier_results['weights'].shape
+        contributions = frontier_results['risk_contributions']
+        
+        return pd.DataFrame(
+            contributions,
+            columns=[f'Asset_{i}' for i in range(n_assets)],
+            index=[f'Point_{i}' for i in range(n_points)]
+        )
     
     def plot_frontier(self, frontier_results: Dict[str, np.ndarray]):
-        """Create comprehensive frontier visualization"""
+        """Create comprehensive Garlappi frontier visualization"""
         fig = plt.figure(figsize=(20, 15))
         gs = plt.GridSpec(2, 2)
         
-        # 1. Risk-Return Plot
+        # 1. Risk-Return Plot with Robust Sharpe Ratios
         ax1 = fig.add_subplot(gs[0, 0])
-        self._plot_risk_return(frontier_results, ax1)
+        self._plot_risk_return_robust(frontier_results, ax1)
         
-        # 2. Worst-Case Returns
+        # 2. Uncertainty Impact
         ax2 = fig.add_subplot(gs[0, 1])
-        self._plot_worst_case_returns(frontier_results, ax2)
+        self._plot_uncertainty_impact(frontier_results, ax2)
         
         # 3. Portfolio Composition
         ax3 = fig.add_subplot(gs[1, 0])
         self._plot_weights_evolution(frontier_results, ax3)
         
-        # 4. Diversification Metrics
+        # 4. Diversification and Uncertainty
         ax4 = fig.add_subplot(gs[1, 1])
-        self._plot_diversification_metrics(frontier_results, ax4)
+        self._plot_diversification_uncertainty(frontier_results, ax4)
         
         plt.tight_layout()
         plt.show()
         
-    def _plot_risk_return(self, results: Dict[str, np.ndarray], ax: plt.Axes):
-        """Plot risk-return frontier with Sharpe ratio information"""
+    def _plot_risk_return_robust(self, results: Dict[str, np.ndarray], ax: plt.Axes):
+        """Plot risk-return frontier with robust Sharpe ratios"""
         sc = ax.scatter(
             results['risks'],
             results['returns'],
-            c=results['sharpe_ratios'],
+            c=results['robust_sharpe_ratios'],
             cmap='viridis',
             s=100
         )
-        plt.colorbar(sc, ax=ax, label='Sharpe Ratio')
+        plt.colorbar(sc, ax=ax, label='Robust Sharpe Ratio')
         
         ax.set_xlabel('Risk (Volatility)')
         ax.set_ylabel('Expected Return')
-        ax.set_title('Robust Efficient Frontier')
+        ax.set_title('Garlappi Robust Efficient Frontier')
         ax.grid(True)
         
-    def _plot_worst_case_returns(self, results: Dict[str, np.ndarray], ax: plt.Axes):
-        """Plot worst-case returns against expected returns"""
-        ax.plot(results['risks'], results['returns'], 'b-', label='Expected Returns')
-        ax.plot(results['risks'], results['worst_case_returns'], 'r--', label='Worst-Case Returns')
-        ax.fill_between(results['risks'], results['worst_case_returns'], results['returns'], alpha=0.2)
+    def _plot_uncertainty_impact(self, results: Dict[str, np.ndarray], ax: plt.Axes):
+        """Plot impact of uncertainty parameter"""
+        ax.scatter(results['epsilons'], results['worst_case_returns'], 
+                  c=results['risks'], cmap='viridis', label='Worst-Case Returns')
+        plt.colorbar(ax.collections[0], ax=ax, label='Risk Level')
         
-        ax.set_xlabel('Risk (Volatility)')
-        ax.set_ylabel('Return')
-        ax.set_title('Expected vs Worst-Case Returns')
-        ax.legend()
+        ax.set_xlabel('Uncertainty Parameter (ε)')
+        ax.set_ylabel('Worst-Case Return')
+        ax.set_title('Impact of Uncertainty on Returns')
         ax.grid(True)
         
-    def _plot_weights_evolution(self, results: Dict[str, np.ndarray], ax: plt.Axes):
-        """Plot evolution of portfolio weights along the frontier"""
-        weights = results['weights']
-        risks = results['risks']
-        
-        for i in range(weights.shape[1]):
-            ax.plot(risks, weights[:, i], label=f'Asset {i+1}')
-            
-        ax.set_xlabel('Risk (Volatility)')
-        ax.set_ylabel('Weight')
-        ax.set_title('Portfolio Composition Evolution')
-        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-        ax.grid(True)
-        
-    def _plot_diversification_metrics(self, results: Dict[str, np.ndarray], ax: plt.Axes):
-        """Plot diversification metrics along the frontier"""
+    def _plot_diversification_uncertainty(self, results: Dict[str, np.ndarray], ax: plt.Axes):
+        """Plot relationship between diversification and estimation uncertainty"""
         ax2 = ax.twinx()
         
-        l1 = ax.plot(results['risks'], results['diversification_ratios'], 'b-',
-                    label='Diversification Ratio')
+        l1 = ax.plot(results['risks'], results['estimation_uncertainty'], 'b-',
+                    label='Estimation Uncertainty')
         l2 = ax2.plot(results['risks'], results['effective_n'], 'r--',
                      label='Effective N')
         
         ax.set_xlabel('Risk (Volatility)')
-        ax.set_ylabel('Diversification Ratio', color='b')
+        ax.set_ylabel('Estimation Uncertainty', color='b')
         ax2.set_ylabel('Effective N', color='r')
         
         lns = l1 + l2
         labs = [l.get_label() for l in lns]
         ax.legend(lns, labs)
         
-        ax.set_title('Diversification Metrics')
+        ax.set_title('Diversification and Parameter Uncertainty')
         ax.grid(True)
-
+        
 class RobustBacktestOptimizer(RobustPortfolioOptimizer):
     """Class for performing vectorized backtesting of portfolio optimization strategies"""
     
@@ -1336,8 +1433,8 @@ class RobustBacktestOptimizer(RobustPortfolioOptimizer):
                     # Create temporary optimizer for this period
                     period_optimizer = RobustPortfolioOptimizer(
                         returns=historical_returns,
-                        uncertainty=self.uncertainty,
-                        risk_aversion=self.risk_aversion,
+                        epsilon=self.epsilon,
+                        alpha=self.alpha,
                         optimization_method=self.optimization_method,
                         half_life=self.half_life,
                         risk_free_rate=self.risk_free_rate,
