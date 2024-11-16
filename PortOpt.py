@@ -69,6 +69,7 @@ class ObjectiveFunction(Enum):
     RISK_PARITY = "risk_parity"
     EQUAL_RISK_CONTRIBUTION = "equal_risk_contribution"
     HIERARCHICAL_RISK_PARITY = "hierarchical_risk_parity"
+    
 class PortfolioObjective:
     """Portfolio objective function factory"""
     
