@@ -1126,18 +1126,19 @@ class RobustPortfolioOptimizer(PortfolioOptimizer):
             'robust_sharpe': (worst_case_return - self.risk_free_rate) / portfolio_risk,
             'risk_contributions': risk_contributions
         }
+
 class RobustEfficientFrontier(RobustPortfolioOptimizer):
     """Class for computing Garlappi robust efficient frontier with asset-specific risk aversion"""
     
     def __init__(self, returns: pd.DataFrame, **kwargs):
         super().__init__(returns, **kwargs)
-        
+
     def compute_efficient_frontier(
         self,
         n_points: int = 15,
         epsilon_range: Optional[Tuple[float, float]] = None,
         risk_range: Optional[Tuple[float, float]] = None,
-        alpha_scale_range: Optional[Tuple[float, float]] = None,  # Added alpha scaling range
+        alpha_scale_range: Optional[Tuple[float, float]] = None,
         constraints: Optional[OptimizationConstraints] = None
     ) -> Dict[str, np.ndarray]:
         """
@@ -1166,9 +1167,9 @@ class RobustEfficientFrontier(RobustPortfolioOptimizer):
             
         # Get alpha scale range if not provided
         if alpha_scale_range is None:
-            alpha_scale_range = (0.5, 1.5)  # Default range to scale alpha vector
+            alpha_scale_range = (0.5, 1.5)
             
-        # Initialize result containers
+        # Initialize result containers with all metrics
         frontier_results = {
             'returns': np.zeros(n_points),
             'risks': np.zeros(n_points),
@@ -1184,6 +1185,7 @@ class RobustEfficientFrontier(RobustPortfolioOptimizer):
             'risk_contributions': np.zeros((n_points, len(self.returns.columns)))
         }
         
+        # Compute frontier points with progress bar
         for i in tqdm(range(n_points)):
             try:
                 # Interpolate parameters
@@ -1197,16 +1199,16 @@ class RobustEfficientFrontier(RobustPortfolioOptimizer):
                 # Create constraints with target risk
                 point_constraints = self._create_frontier_constraints(constraints, target_risk)
                 
-                # Optimize portfolio with varying parameters
+                # Optimize portfolio
                 result = self.optimize(
                     objective=ObjectiveFunction.GARLAPPI_ROBUST,
                     constraints=point_constraints,
                     epsilon=target_epsilon,
-                    alpha=scaled_alpha,  # Use scaled alpha vector
+                    alpha=scaled_alpha,
                     omega=self.omega
                 )
                 
-                # Store results
+                # Store basic results
                 frontier_results['returns'][i] = result['return']
                 frontier_results['risks'][i] = result['risk']
                 frontier_results['sharpe_ratios'][i] = result['sharpe_ratio']
@@ -1214,7 +1216,7 @@ class RobustEfficientFrontier(RobustPortfolioOptimizer):
                 frontier_results['epsilons'][i] = target_epsilon
                 frontier_results['alpha_scales'][i] = alpha_scale
                 
-                # Calculate and store robust metrics with scaled alpha
+                # Calculate and store robust metrics
                 robust_metrics = self.calculate_robust_metrics(result['weights'], scaled_alpha)
                 frontier_results['worst_case_returns'][i] = robust_metrics['worst_case_return']
                 frontier_results['diversification_ratios'][i] = robust_metrics['diversification_ratio']
@@ -1227,86 +1229,17 @@ class RobustEfficientFrontier(RobustPortfolioOptimizer):
                 print(f"Failed to compute frontier point {i}: {str(e)}")
                 continue
         
-        # Clean up any failed points
+        # Clean up failed points and sort results
         mask = frontier_results['risks'] > 0
         for key in frontier_results:
             frontier_results[key] = frontier_results[key][mask]
             
-        # Sort by risk
         sort_idx = np.argsort(frontier_results['risks'])
         for key in frontier_results:
             frontier_results[key] = frontier_results[key][sort_idx]
             
         return frontier_results
-
-    def _get_risk_bounds(self) -> Tuple[float, float]:
-        """Compute minimum and maximum risk bounds with asset-specific risk aversion"""
-        try:
-            # Minimum risk portfolio (global minimum variance)
-            min_var_result = self.optimize(
-                objective=ObjectiveFunction.MINIMUM_VARIANCE,
-                constraints=OptimizationConstraints(long_only=True)
-            )
-            min_risk = min_var_result['risk']
-            
-            # Maximum risk portfolio with reduced risk aversion
-            reduced_alpha = self.alpha * 0.5  # Reduce risk aversion for upper bound
-            max_risk_result = self.optimize(
-                objective=ObjectiveFunction.GARLAPPI_ROBUST,
-                constraints=OptimizationConstraints(
-                    long_only=True,
-                    box_constraints={i: (0, 1) for i in range(len(self.returns.columns))}
-                ),
-                epsilon=self.epsilon,
-                alpha=reduced_alpha
-            )
-            
-            # Use maximum individual asset risk as a reference
-            asset_stds = np.sqrt(np.diag(self.covariance))
-            max_asset_risk = asset_stds.max()
-            
-            # Take the larger of maximum portfolio risk and maximum asset risk
-            max_risk = max(max_risk_result['risk'], max_asset_risk)
-            
-            # Add buffer to risk bounds
-            max_risk *= 1.2  # Add 20% buffer to maximum risk
-            min_risk *= 0.8  # Reduce minimum risk by 20%
-            
-            return min_risk, max_risk
-            
-        except Exception as e:
-            print(f"Error computing risk bounds: {str(e)}")
-            # Fallback to standard deviation range
-            asset_stds = np.sqrt(np.diag(self.covariance))
-            return asset_stds.min() * 0.8, asset_stds.max() * 2
-
-    def _create_frontier_constraints(
-        self,
-        base_constraints: OptimizationConstraints,
-        target_risk: float
-    ) -> OptimizationConstraints:
-        """Create constraints for frontier point with target risk"""
-        return OptimizationConstraints(
-            group_constraints=base_constraints.group_constraints,
-            box_constraints=base_constraints.box_constraints,
-            long_only=base_constraints.long_only,
-            max_turnover=base_constraints.max_turnover,
-            target_risk=target_risk,
-            max_tracking_error=base_constraints.max_tracking_error,
-            benchmark_weights=base_constraints.benchmark_weights
-        )
-
-    def calculate_frontier_risk_contributions(self, frontier_results: Dict[str, np.ndarray]) -> pd.DataFrame:
-        """Calculate and analyze risk contributions across the frontier"""
-        n_points, n_assets = frontier_results['weights'].shape
-        contributions = frontier_results['risk_contributions']
         
-        return pd.DataFrame(
-            contributions,
-            columns=[f'Asset_{i}' for i in range(n_assets)],
-            index=[f'Point_{i}' for i in range(n_points)]
-        )
-    
     def plot_frontier(self, frontier_results: Dict[str, np.ndarray]):
         """Create comprehensive Garlappi frontier visualization"""
         fig = plt.figure(figsize=(20, 15))
@@ -1358,6 +1291,20 @@ class RobustEfficientFrontier(RobustPortfolioOptimizer):
         ax.set_title('Impact of Uncertainty on Returns')
         ax.grid(True)
         
+    def _plot_weights_evolution(self, results: Dict[str, np.ndarray], ax: plt.Axes):
+        """Plot evolution of portfolio weights along the frontier"""
+        weights = results['weights']
+        risks = results['risks']
+        
+        for i in range(weights.shape[1]):
+            ax.plot(risks, weights[:, i], label=f'Asset {i+1}')
+            
+        ax.set_xlabel('Risk (Volatility)')
+        ax.set_ylabel('Weight')
+        ax.set_title('Portfolio Composition Evolution')
+        ax.legend(bbox_to_anchor=(1.05, 1), loc='upper left', ncol=2)
+        ax.grid(True)
+        
     def _plot_diversification_uncertainty(self, results: Dict[str, np.ndarray], ax: plt.Axes):
         """Plot relationship between diversification and estimation uncertainty"""
         ax2 = ax.twinx()
@@ -1377,6 +1324,73 @@ class RobustEfficientFrontier(RobustPortfolioOptimizer):
         
         ax.set_title('Diversification and Parameter Uncertainty')
         ax.grid(True)
+
+    def _get_risk_bounds(self) -> Tuple[float, float]:
+        """Compute minimum and maximum risk bounds"""
+        try:
+            # Minimum risk portfolio
+            min_var_result = self.optimize(
+                objective=ObjectiveFunction.MINIMUM_VARIANCE,
+                constraints=OptimizationConstraints(long_only=True)
+            )
+            min_risk = min_var_result['risk']
+            
+            # Maximum risk portfolio with reduced risk aversion
+            reduced_alpha = self.alpha * 0.5
+            max_risk_result = self.optimize(
+                objective=ObjectiveFunction.GARLAPPI_ROBUST,
+                constraints=OptimizationConstraints(
+                    long_only=True,
+                    box_constraints={i: (0, 1) for i in range(len(self.returns.columns))}
+                ),
+                epsilon=self.epsilon,
+                alpha=reduced_alpha
+            )
+            
+            # Use maximum individual asset risk as reference
+            asset_stds = np.sqrt(np.diag(self.covariance))
+            max_asset_risk = asset_stds.max()
+            
+            # Take larger of maximum portfolio risk and maximum asset risk
+            max_risk = max(max_risk_result['risk'], max_asset_risk)
+            
+            # Add buffers
+            max_risk *= 1.2
+            min_risk *= 0.8
+            
+            return min_risk, max_risk
+            
+        except Exception as e:
+            print(f"Error computing risk bounds: {str(e)}")
+            asset_stds = np.sqrt(np.diag(self.covariance))
+            return asset_stds.min() * 0.8, asset_stds.max() * 2
+
+    def _create_frontier_constraints(
+        self,
+        base_constraints: OptimizationConstraints,
+        target_risk: float
+    ) -> OptimizationConstraints:
+        """Create constraints for frontier point with target risk"""
+        return OptimizationConstraints(
+            group_constraints=base_constraints.group_constraints,
+            box_constraints=base_constraints.box_constraints,
+            long_only=base_constraints.long_only,
+            max_turnover=base_constraints.max_turnover,
+            target_risk=target_risk,
+            max_tracking_error=base_constraints.max_tracking_error,
+            benchmark_weights=base_constraints.benchmark_weights
+        )
+
+    def calculate_frontier_risk_contributions(self, frontier_results: Dict[str, np.ndarray]) -> pd.DataFrame:
+        """Calculate and analyze risk contributions across the frontier"""
+        n_points, n_assets = frontier_results['weights'].shape
+        contributions = frontier_results['risk_contributions']
+        
+        return pd.DataFrame(
+            contributions,
+            columns=[f'Asset_{i}' for i in range(n_assets)],
+            index=[f'Point_{i}' for i in range(n_points)]
+        )
         
 class RobustBacktestOptimizer(RobustPortfolioOptimizer):
     """Class for performing vectorized backtesting of portfolio optimization strategies"""
