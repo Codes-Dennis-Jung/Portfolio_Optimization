@@ -259,3 +259,15 @@ if __name__ == "__main__":
     data = get_multi_asset_test_data()
     stats = analyze_universe(data)
     result = run_backtest_example()
+    
+'''
+performance_risk_table(
+    data: Union[pd.DataFrame, pd.Series],
+    bmk: Union[pd.DataFrame, pd.Series],
+    rfr: Union[pd.DataFrame, pd.Series, float],
+    scale: str = "monthly",
+    geometric: bool = True,
+    percent: bool = True,
+    cutoff: float = 0.05
+)
+'''

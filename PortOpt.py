@@ -1391,7 +1391,7 @@ class RobustEfficientFrontier(RobustPortfolioOptimizer):
             columns=[f'Asset_{i}' for i in range(n_assets)],
             index=[f'Point_{i}' for i in range(n_points)]
         )
-        
+
 class RobustBacktestOptimizer(RobustPortfolioOptimizer):
     """Class for performing vectorized backtesting of portfolio optimization strategies"""
     
