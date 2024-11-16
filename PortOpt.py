@@ -54,6 +54,7 @@ class OptimizationConstraints:
 class OptimizationMethod(Enum):
     SCIPY = "scipy"
     CVXPY = "cvxpy"
+    
 class ObjectiveFunction(Enum):
     GARLAPPI_ROBUST = "garlappi_robust"
     MINIMUM_VARIANCE = "minimum_variance"
