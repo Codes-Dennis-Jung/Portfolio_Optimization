@@ -199,75 +199,391 @@ def analyze_universe(data: Dict):
     return stats
 
 # Example usage
-def run_backtest_example():
-    """Run backtest example with multiple strategies"""
-    # Get test data
-    res = get_multi_asset_test_data()
-    returns = res['returns']
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+import seaborn as sns
+from typing import Dict, List, Optional, Tuple, Union
+from PortOpt import *
+
+def test_multi_asset_backtest():
+    """Test multi-asset portfolio optimization backtest"""
+    # Step 1: Load and analyze universe data
+    print("Step 1: Loading and analyzing universe data...")
+    universe_data = get_multi_asset_test_data()
+    returns = universe_data['returns']
+    asset_mapping = universe_data['asset_mapping']
     
-    # Initialize backtest optimizer
-    backtest_optimizer = RobustBacktestOptimizer(
+    # Analyze universe characteristics
+    print("\nStep 2: Analyzing universe characteristics...")
+    universe_stats = analyze_universe(universe_data)
+    
+    print("\nStep 3: Setting up optimization constraints...")
+    # Create group constraints based on asset classes
+    group_constraints = {}
+    asset_classes = set(info['class'] for info in asset_mapping.values())
+    
+    # Create mapping of column names to indices
+    col_to_idx = {col: i for i, col in enumerate(returns.columns)}
+    
+    # Set up asset class constraints
+    for asset_class in asset_classes:
+        assets_in_class = [
+            col_to_idx[symbol] for symbol in returns.columns
+            if asset_mapping[symbol]['class'] == asset_class
+        ]
+        
+        if assets_in_class:
+            group_constraints[asset_class] = GroupConstraint(
+                assets=assets_in_class,
+                bounds=(0.05, 0.4)  # 5% min, 40% max per asset class
+            )
+    
+    # Initialize backtester
+    print("\nStep 4: Initializing backtester...")
+    backtester = RobustBacktestOptimizer(
         returns=returns,
-        uncertainty=0.1,
-        risk_aversion=0.5,
-        lookback_window=36,  # 1 year
-        rebalance_frequency=1  # Quarterly
+        lookback_window=24,           # 2 years
+        rebalance_frequency=3,        # Quarterly
+        epsilon=0.1,                  # Uncertainty parameter
+        transaction_cost=0.001,       # 10bps per trade
+        risk_free_rate=universe_data['risk_free_rate'],
+        use_cross_validation=False,   # Disable CV for testing
+        estimation_method='standard',
+        risk_estimator='empirical'
     )
     
-    # Define strategies to test
-    strategies = {
-        "Robust Mean-Variance": (
-            ObjectiveFunction.ROBUST_MEAN_VARIANCE,
-            OptimizationConstraints(
-                long_only=True,
-                box_constraints={i: (0.0, 0.2) for i in range(len(returns.columns))}
-            ),
-            {'epsilon': 0.1, 'kappa': 1.}
-        ),
-        "Risk Parity": (
-            ObjectiveFunction.RISK_PARITY,
-            OptimizationConstraints(long_only=True),
-            {}
-        )
-    }
+    # Define portfolio constraints
+    constraints = OptimizationConstraints(
+        long_only=True,
+        box_constraints={i: (0.0, 0.3) for i in range(len(returns.columns))},  # Max 30% per asset
+        group_constraints=group_constraints,
+        max_turnover=0.5  # 50% max turnover per rebalance
+    )
     
-    # Run backtests
+    # Define strategies to test (start with just minimum variance)
+    strategies = [
+        (ObjectiveFunction.MINIMUM_VARIANCE, "Minimum Variance", {})
+    ]
+    
+    print("\nStep 5: Running backtests...")
     results = {}
-    for name, (objective, constraints, kwargs) in strategies.items():
-        print(f"\nBacktesting {name} strategy...")
+    successful_strategies = []
+    
+    for objective, name, params in strategies:
+        print(f"\nTesting {name} strategy...")
         try:
-            result = backtest_optimizer.run_backtest(
+            # Initialize with equal weights
+            initial_weights = pd.Series(
+                np.ones(len(returns.columns)) / len(returns.columns),
+                index=returns.columns
+            )
+            
+            # Run backtest
+            strategy_result = backtester.run_backtest(
                 objective=objective,
                 constraints=constraints,
-                **kwargs
+                current_weights=initial_weights,
+                **params
             )
-            results[name] = result
             
-            # Print metrics
-            print("\nBacktest Metrics:")
-            print(result['backtest_metrics'])
+            # Print strategy summary
+            metrics = strategy_result['backtest_metrics']
+            print(f"\n{name} Performance Summary:")
+            print(f"Annualized Return: {float(metrics['Annualized Return']):.2%}")
+            print(f"Volatility: {float(metrics['Volatility']):.2%}")
+            print(f"Sharpe Ratio: {float(metrics['Sharpe Ratio']):.2f}")
+            print(f"Maximum Drawdown: {float(metrics['Maximum Drawdown']):.2%}")
+            print(f"Average Turnover: {float(metrics['Average Turnover']):.2%}")
             
-            # Plot results
-            backtest_optimizer.plot_backtest_results(result)
+            # Store results
+            results[name] = strategy_result
+            successful_strategies.append(name)
+            
+            # Print asset class exposures
+            weights = strategy_result['weights'].mean()
+            print("\nAverage Asset Class Exposures:")
+            for asset_class in asset_classes:
+                exposure = sum(
+                    weights[symbol] for symbol in weights.index
+                    if asset_mapping[symbol]['class'] == asset_class
+                )
+                print(f"{asset_class}: {exposure:.1%}")
             
         except Exception as e:
-            print(f"Backtest failed for {name}: {str(e)}")
+            print(f"Error testing {name} strategy: {str(e)}")
+            import traceback
+            print(traceback.format_exc())
     
-    return results
+    if successful_strategies:
+        print("\nStep 6: Analyzing results...")
+        try:
+            # Compare strategies
+            comparison = analyze_strategy_results(
+                {k: results[k] for k in successful_strategies},
+                asset_mapping
+            )
+            
+            print("\nStrategy Comparison Summary:")
+            print(comparison.round(3))
+            
+            # Plot results
+            print("\nStep 7: Generating visualizations...")
+            plot_strategy_comparison(
+                {k: results[k] for k in successful_strategies},
+                universe_data
+            )
+            
+            return {
+                'results': results,
+                'comparison': comparison,
+                'universe_data': universe_data,
+                'universe_stats': universe_stats
+            }
+        except Exception as e:
+            print(f"Error in analysis: {str(e)}")
+            import traceback
+            print(traceback.format_exc())
+            return None
+    else:
+        print("No strategies completed successfully.")
+        return None
+
+def run_multi_asset_test():
+    """Main function to run multi-asset backtest test"""
+    try:
+        print("Starting multi-asset backtest test...")
+        test_results = test_multi_asset_backtest()
+        
+        if test_results is not None:
+            print("\nTest completed successfully!")
+            
+            # Print detailed analysis
+            print("\nStrategy Asset Class Exposures:")
+            exposures = test_results['comparison'].filter(regex='Exposure$')
+            print(exposures.round(3))
+            
+            # Plot additional analysis
+            plot_additional_analysis(test_results)
+            
+            return test_results
+            
+    except Exception as e:
+        print(f"Test failed: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+        return None
+
+def analyze_strategy_results(
+    results: Dict[str, Dict],
+    asset_mapping: Dict[str, Dict]
+) -> pd.DataFrame:
+    """
+    Analyze and compare strategy performance
+    
+    Args:
+        results: Dictionary of strategy results
+        asset_mapping: Asset class mapping information
+    """
+    summary = pd.DataFrame()
+    
+    for strategy_name, result in results.items():
+        metrics = result['backtest_metrics']
+        
+        # Basic metrics (ensure all values are float)
+        summary.loc[strategy_name, 'Total Return'] = float(metrics['Total Return'])
+        summary.loc[strategy_name, 'Ann. Return'] = float(metrics['Annualized Return'])
+        summary.loc[strategy_name, 'Ann. Volatility'] = float(metrics['Volatility'])
+        summary.loc[strategy_name, 'Sharpe Ratio'] = float(metrics['Sharpe Ratio'])
+        summary.loc[strategy_name, 'Max Drawdown'] = float(metrics['Maximum Drawdown'])
+        summary.loc[strategy_name, 'Avg Turnover'] = float(metrics['Average Turnover'])
+        
+        # Calculate average asset class exposures
+        weights_df = result['weights']
+        avg_weights = weights_df.mean()
+        
+        for asset_class in set(info['class'] for info in asset_mapping.values()):
+            class_weight = sum(
+                avg_weights[symbol] 
+                for symbol in avg_weights.index
+                if asset_mapping[symbol]['class'] == asset_class
+            )
+            summary.loc[strategy_name, f'{asset_class} Exposure'] = float(class_weight)
+    
+    return summary
+
+def plot_strategy_comparison(
+    results: Dict[str, Dict],
+    universe_data: Dict
+):
+    """Create comprehensive visualization of strategy comparison with proper date handling"""
+    fig = plt.figure(figsize=(20, 15))
+    gs = plt.GridSpec(3, 2)
+    
+    # Convert timestamps to datetime for plotting
+    def prepare_dates(index):
+        return pd.to_datetime(index).tz_localize(None)
+    
+    # 1. Cumulative Returns
+    ax1 = fig.add_subplot(gs[0, :])
+    for strategy_name, result in results.items():
+        cum_returns = (1 + result['returns']).cumprod()
+        ax1.plot(prepare_dates(cum_returns.index), 
+                cum_returns.values, 
+                label=strategy_name, 
+                linewidth=2)
+    ax1.set_title('Cumulative Strategy Returns')
+    ax1.legend(loc='upper left')
+    ax1.grid(True)
+    
+    # 2. Drawdowns
+    ax2 = fig.add_subplot(gs[1, 0])
+    for strategy_name, result in results.items():
+        cum_returns = (1 + result['returns']).cumprod()
+        peak = cum_returns.expanding().max()
+        drawdown = (cum_returns - peak) / peak
+        ax2.plot(prepare_dates(drawdown.index), 
+                drawdown.values, 
+                label=strategy_name)
+    ax2.set_title('Strategy Drawdowns')
+    ax2.legend(loc='lower left')
+    ax2.grid(True)
+    
+    # 3. Rolling Sharpe Ratios
+    ax3 = fig.add_subplot(gs[1, 1])
+    window = 24  # 2-year rolling window
+    rf_rate = universe_data['risk_free_rate']
+    for strategy_name, result in results.items():
+        returns = result['returns']
+        rolling_ret = returns.rolling(window).mean() * 12
+        rolling_vol = returns.rolling(window).std() * np.sqrt(12)
+        rolling_sharpe = (rolling_ret - rf_rate * 12) / rolling_vol
+        ax3.plot(prepare_dates(rolling_sharpe.index), 
+                rolling_sharpe.values, 
+                label=strategy_name)
+    ax3.set_title('Rolling 2-Year Sharpe Ratio')
+    ax3.legend(loc='upper left')
+    ax3.grid(True)
+    
+    # 4. Asset Class Exposures
+    ax4 = fig.add_subplot(gs[2, 0])
+    asset_mapping = universe_data['asset_mapping']
+    asset_classes = sorted(set(info['class'] for info in asset_mapping.values()))
+    
+    strategy_exposures = []
+    strategy_names = []
+    
+    for strategy_name, result in results.items():
+        weights_df = result['weights']
+        avg_weights = weights_df.mean()
+        exposures = []
+        
+        for asset_class in asset_classes:
+            class_weight = sum(
+                avg_weights[symbol] for symbol in avg_weights.index
+                if asset_mapping[symbol]['class'] == asset_class
+            )
+            exposures.append(class_weight)
+            
+        strategy_exposures.append(exposures)
+        strategy_names.append(strategy_name)
+    
+    exposures_df = pd.DataFrame(
+        strategy_exposures,
+        columns=asset_classes,
+        index=strategy_names
+    )
+    
+    exposures_df.plot(kind='bar', stacked=True, ax=ax4)
+    ax4.set_title('Average Asset Class Exposures')
+    ax4.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+    ax4.set_xticklabels(ax4.get_xticklabels(), rotation=45)
+    
+    # 5. Risk-Return Scatter
+    ax5 = fig.add_subplot(gs[2, 1])
+    ann_returns = []
+    ann_vols = []
+    
+    for strategy_name, result in results.items():
+        returns = result['returns']
+        ann_ret = float(result['backtest_metrics']['Annualized Return'])
+        ann_vol = float(result['backtest_metrics']['Volatility'])
+        ann_returns.append(ann_ret)
+        ann_vols.append(ann_vol)
+        
+        ax5.scatter(ann_vol, ann_ret, s=100)
+        ax5.annotate(
+            strategy_name, 
+            (ann_vol, ann_ret),
+            xytext=(5, 5),
+            textcoords='offset points'
+        )
+    
+    ax5.set_xlabel('Annualized Volatility')
+    ax5.set_ylabel('Annualized Return')
+    ax5.set_title('Risk-Return Comparison')
+    ax5.grid(True)
+    
+    # Adjust layout and display
+    plt.tight_layout()
+    plt.show()
+
+def plot_additional_analysis(test_results: Dict):
+    """Plot additional analysis charts"""
+    if test_results is None:
+        return
+        
+    # Plot cumulative returns comparison
+    plt.figure(figsize=(12, 6))
+    for name, result in test_results['results'].items():
+        cum_returns = (1 + result['returns']).cumprod()
+        # Convert timestamps for plotting
+        dates = pd.to_datetime(cum_returns.index).tz_localize(None)
+        plt.plot(dates, cum_returns.values, label=name)
+    
+    plt.title('Cumulative Strategy Returns')
+    plt.xlabel('Date')
+    plt.ylabel('Cumulative Return')
+    plt.legend()
+    plt.grid(True)
+    plt.show()
+    
+    # Plot rolling correlation heatmap if multiple strategies
+    if len(test_results['results']) > 1:
+        returns_df = pd.DataFrame({
+            name: result['returns']
+            for name, result in test_results['results'].items()
+        })
+        
+        plt.figure(figsize=(10, 8))
+        sns.heatmap(
+            returns_df.corr(),
+            annot=True,
+            cmap='RdYlBu_r',
+            center=0,
+            vmin=-1,
+            vmax=1
+        )
+        plt.title('Strategy Return Correlations')
+        plt.show()
 
 if __name__ == "__main__":
-    data = get_multi_asset_test_data()
-    stats = analyze_universe(data)
-    result = run_backtest_example()
-    
-'''
-performance_risk_table(
-    data: Union[pd.DataFrame, pd.Series],
-    bmk: Union[pd.DataFrame, pd.Series],
-    rfr: Union[pd.DataFrame, pd.Series, float],
-    scale: str = "monthly",
-    geometric: bool = True,
-    percent: bool = True,
-    cutoff: float = 0.05
-)
-'''
+    try:
+        print("Starting multi-asset backtest test...")
+        test_results = test_multi_asset_backtest()
+        
+        if test_results is not None:
+            print("\nTest completed successfully!")
+            
+            # Additional analysis
+            print("\nAsset Class Exposures:")
+            exposures = test_results['comparison'].filter(regex='Exposure$')
+            print(exposures.round(3))
+            
+            # Plot additional analysis
+            plot_additional_analysis(test_results)
+            
+    except Exception as e:
+        print(f"Test failed: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
