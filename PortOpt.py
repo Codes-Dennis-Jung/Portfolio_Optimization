@@ -137,55 +137,57 @@ class PortfolioObjective:
                         omega_method: str = 'bayes', omega: Optional[np.ndarray] = None) -> callable:
         """
         Implements Garlappi et al. (2007) robust portfolio optimization with fixed inputs
-        
-        Args:
-            returns: Historical returns matrix (T x N)
-            epsilon: Size of uncertainty region (ε)
-            alpha: Asset-specific risk aversion parameters (N,)
-            omega_method: Method to compute estimation error covariance
-            omega: Optional pre-computed estimation error covariance matrix
         """
         # Ensure returns is 2-d numpy array
         if isinstance(returns, pd.DataFrame):
             returns = returns.values
+        returns = np.atleast_2d(returns)
         
-        if len(returns.shape) == 1:
-            returns = returns.reshape(-1, 1)
-            
         # Calculate required inputs
         mu = np.mean(returns, axis=0)
         Sigma = np.cov(returns, rowvar=False)
         
+        # Ensure alpha is proper array
+        alpha = np.asarray(alpha).flatten()
+        
         # Calculate Omega if not provided
         if omega is None:
-            Omega = self.__calculate_estimation_error_covariance(returns, method=omega_method)
+            Omega = PortfolioObjective._PortfolioObjective__calculate_estimation_error_covariance(
+                returns, 
+                method=omega_method
+            )
         else:
             Omega = omega
             
         def objective(w: np.ndarray) -> float:
-            # Ensure w is 2-d
-            if len(w.shape) == 1:
-                w = w.reshape(-1, 1)
+            try:
+                # Ensure w is 1-d array
+                w = np.asarray(w).flatten()
                 
-            # Asset-specific risk penalties
-            risk_penalties = np.diag(alpha) @ Sigma
-            variance_penalty = 0.5 * w.T @ risk_penalties @ w
-            
-            # Handle numerical instability
-            omega_w_norm = np.sqrt(w.T @ Omega @ w)
-            if omega_w_norm < 1e-8:
-                return np.inf
-            
-            # Worst-case mean adjustment
-            omega_w = Omega @ w
-            scaling = np.sqrt(epsilon * omega_w_norm)
-            worst_case_mean = mu - scaling * omega_w / omega_w_norm
-            
-            # Complete objective
-            robust_utility = w.T @ worst_case_mean - variance_penalty
-            
-            return -float(robust_utility)  # Ensure scalar output
-            
+                # Asset-specific risk penalties
+                risk_penalties = np.diag(alpha) @ Sigma
+                variance_penalty = 0.5 * w @ risk_penalties @ w
+                
+                # Handle numerical instability
+                omega_w = Omega @ w
+                omega_w_norm = np.sqrt(w @ Omega @ w)
+                
+                if omega_w_norm < 1e-8:
+                    return 1e10  # Large penalty instead of infinity
+                
+                # Worst-case mean adjustment
+                scaling = np.sqrt(epsilon * omega_w_norm)
+                worst_case_mean = mu - scaling * omega_w / omega_w_norm
+                
+                # Complete objective
+                robust_utility = w @ worst_case_mean - variance_penalty
+                
+                return -float(robust_utility)  # Ensure scalar output
+                
+            except Exception as e:
+                print(f"Error in objective function: {str(e)}")
+                return 1e10  # Return large penalty on error
+                
         return objective
     
     @staticmethod
@@ -1494,151 +1496,147 @@ class RobustBacktestOptimizer(RobustPortfolioOptimizer):
         }
         
     def run_backtest(
-        self,
-        objective: ObjectiveFunction,
-        constraints: OptimizationConstraints,
-        initial_weights: Optional[np.ndarray] = None,
-        **kwargs
-    ) -> Dict[str, Union[pd.Series, pd.DataFrame]]:
-        """Run backtest with corrected metrics structure"""
-        # Convert returns index to timezone-naive datetime
-        returns = self.returns.copy()
-        returns.index = returns.index.tz_localize(None)
-        
-        dates = returns.index
-        n_assets = len(returns.columns)
-        
-        # Initialize weights if not provided
-        if initial_weights is None:
-            initial_weights = np.ones(n_assets) / n_assets
+            self,
+            objective: ObjectiveFunction,
+            constraints: OptimizationConstraints,
+            initial_weights: Optional[np.ndarray] = None,
+            **kwargs
+        ) -> Dict[str, Union[pd.Series, pd.DataFrame]]:
+            """Run backtest with corrected array handling"""
+            # Convert returns index to timezone-naive datetime
+            returns = self.returns.copy()
+            returns.index = returns.index.tz_localize(None)
             
-        # Initialize results containers with explicit dtypes and timezone-naive index
-        portfolio_weights = pd.DataFrame(
-            0.0, 
-            index=dates, 
-            columns=returns.columns,
-            dtype=np.float64
-        )
-        portfolio_returns = pd.Series(0.0, index=dates, dtype=np.float64)
-        realized_costs = pd.Series(0.0, index=dates, dtype=np.float64)
-        optimization_metrics = pd.DataFrame(
-            0.0,
-            index=dates,
-            columns=['expected_return', 'expected_risk', 'sharpe_ratio'],
-            dtype=np.float64
-        )
-        parameters_history = pd.DataFrame(
-            0.0,
-            index=dates,
-            columns=['epsilon', 'mean_return', 'volatility'],
-            dtype=np.float64
-        )
-        
-        current_weights = initial_weights.copy()
-        
-        print("Running backtest...")
-        try:
-            for t in tqdm(range(self.lookback_window, len(dates))):
-                current_date = dates[t]
-                
-                # Determine if rebalancing is needed
-                should_rebalance = (t - self.lookback_window) % self.rebalance_frequency == 0
-                
-                if should_rebalance:
-                    try:
-                        # Get historical data for estimation
-                        historical_returns = returns.iloc[t-self.lookback_window:t]
-                        
-                        # Ensure returns are properly formatted as numpy array
-                        historical_returns_array = historical_returns.values
-                        
-                        # Estimate parameters using numpy array
-                        params = {
-                            'expected_returns': np.mean(historical_returns_array, axis=0),
-                            'covariance': np.cov(historical_returns_array.T)
-                        }
-                        
-                        # Create temporary optimizer
-                        temp_optimizer = RobustPortfolioOptimizer(
-                            returns=historical_returns,
-                            epsilon=self.epsilon,
-                            risk_free_rate=self.risk_free_rate,
-                            transaction_cost=self.transaction_cost
-                        )
-                        
-                        # Optimize portfolio
-                        result = temp_optimizer.optimize(
-                            objective=objective,
-                            constraints=constraints,
-                            current_weights=current_weights,
-                            **kwargs
-                        )
-                        
-                        # Record metrics
-                        optimization_metrics.loc[current_date] = {
-                            'expected_return': result['return'],
-                            'expected_risk': result['risk'],
-                            'sharpe_ratio': result['sharpe_ratio']
-                        }
-                        
-                        # Record parameters
-                        parameters_history.loc[current_date] = {
-                            'epsilon': self.epsilon,
-                            'mean_return': params['expected_returns'].mean(),
-                            'volatility': np.sqrt(np.diag(params['covariance'])).mean()
-                        }
-                        
-                        # Calculate and record costs
-                        costs = self.transaction_cost * np.sum(np.abs(result['weights'] - current_weights))
-                        realized_costs.loc[current_date] = costs
-                        
-                        # Update weights
-                        current_weights = result['weights']
-                        
-                    except Exception as e:
-                        print(f"Optimization failed at {current_date}: {str(e)}")
-                        # Keep current weights if optimization fails
-                        optimization_metrics.loc[current_date] = np.nan
-                        parameters_history.loc[current_date] = np.nan
-                        realized_costs.loc[current_date] = 0
-                        
-                # Record weights
-                portfolio_weights.loc[current_date] = pd.Series(
-                    current_weights, 
-                    index=returns.columns
-                )
-                
-                # Calculate realized return
-                period_return = returns.loc[current_date]
-                portfolio_returns.loc[current_date] = (
-                    period_return @ current_weights - 
-                    realized_costs.loc[current_date]
-                )
-                
-        except KeyboardInterrupt:
-            print("\nBacktest interrupted by user")
+            dates = returns.index
+            n_assets = len(returns.columns)
             
-        # Clean up results
-        portfolio_returns = portfolio_returns.fillna(0)
-        portfolio_weights = portfolio_weights.fillna(method='ffill')
-        optimization_metrics = optimization_metrics.fillna(method='ffill')
-        parameters_history = parameters_history.fillna(method='ffill')
-        realized_costs = realized_costs.fillna(0)
-        
-        # Calculate final metrics
-        metrics = self._calculate_backtest_metrics(
+            # Initialize weights properly as 1-d array
+            if initial_weights is None:
+                initial_weights = np.ones(n_assets) / n_assets
+            else:
+                initial_weights = np.asarray(initial_weights).flatten()
+                
+            # Initialize results containers
+            portfolio_weights = pd.DataFrame(
+                0.0, 
+                index=dates, 
+                columns=returns.columns,
+                dtype=np.float64
+            )
+            portfolio_returns = pd.Series(0.0, index=dates, dtype=np.float64)
+            realized_costs = pd.Series(0.0, index=dates, dtype=np.float64)
+            optimization_metrics = pd.DataFrame(
+                0.0,
+                index=dates,
+                columns=['expected_return', 'expected_risk', 'sharpe_ratio'],
+                dtype=np.float64
+            )
+            
+            current_weights = initial_weights.copy()
+            
+            print("Running backtest...")
+            try:
+                for t in tqdm(range(self.lookback_window, len(dates))):
+                    current_date = dates[t]
+                    
+                    # Determine if rebalancing is needed
+                    should_rebalance = (t - self.lookback_window) % self.rebalance_frequency == 0
+                    
+                    if should_rebalance:
+                        try:
+                            # Get historical data for estimation
+                            historical_returns = returns.iloc[t-self.lookback_window:t]
+                            
+                            # Ensure returns are properly formatted as 2-d numpy array
+                            if isinstance(historical_returns, pd.DataFrame):
+                                historical_returns_array = historical_returns.values
+                            else:
+                                historical_returns_array = np.atleast_2d(historical_returns)
+                                
+                            if len(historical_returns_array.shape) == 1:
+                                historical_returns_array = historical_returns_array.reshape(-1, 1)
+                            
+                            # Create temporary optimizer with proper array shapes
+                            temp_optimizer = RobustPortfolioOptimizer(
+                                returns=pd.DataFrame(
+                                    historical_returns_array,
+                                    index=historical_returns.index,
+                                    columns=returns.columns
+                                ),
+                                epsilon=self.epsilon,
+                                risk_free_rate=self.risk_free_rate,
+                                transaction_cost=self.transaction_cost
+                            )
+                            
+                            # Optimize portfolio with error handling
+                            try:
+                                result = temp_optimizer.optimize(
+                                    objective=objective,
+                                    constraints=constraints,
+                                    current_weights=current_weights.flatten(),  # Ensure 1-d
+                                    **kwargs
+                                )
+                                
+                                # Ensure weights are 1-d
+                                new_weights = np.asarray(result['weights']).flatten()
+                                
+                                # Record metrics
+                                optimization_metrics.loc[current_date] = {
+                                    'expected_return': float(result['return']),  # Ensure scalar
+                                    'expected_risk': float(result['risk']),     # Ensure scalar
+                                    'sharpe_ratio': float(result['sharpe_ratio']) # Ensure scalar
+                                }
+                                
+                                # Calculate and record costs
+                                costs = float(self.transaction_cost * np.sum(np.abs(new_weights - current_weights)))
+                                realized_costs.loc[current_date] = costs
+                                
+                                # Update weights
+                                current_weights = new_weights
+                                
+                            except Exception as e:
+                                print(f"Optimization failed at {current_date}: {str(e)}")
+                                # Keep current weights if optimization fails
+                        
+                        except Exception as e:
+                            print(f"Historical data processing failed at {current_date}: {str(e)}")
+                            continue
+                    
+                    # Record weights
+                    portfolio_weights.loc[current_date] = pd.Series(
+                        current_weights, 
+                        index=returns.columns
+                    )
+                    
+                    # Calculate realized return (ensure proper broadcasting)
+                    period_return = returns.loc[current_date].values.flatten()
+                    portfolio_returns.loc[current_date] = float(
+                        np.dot(period_return, current_weights) - 
+                        realized_costs.loc[current_date]
+                    )
+                    
+            except KeyboardInterrupt:
+                print("\nBacktest interrupted by user")
+                
+            # Clean up results
+            portfolio_returns = portfolio_returns.fillna(0)
+            portfolio_weights = portfolio_weights.fillna(method='ffill')
+            optimization_metrics = optimization_metrics.fillna(method='ffill')
+            realized_costs = realized_costs.fillna(0)
+            
+            # Calculate final metrics
+            metrics = self._calculate_backtest_metrics(
                 portfolio_returns=portfolio_returns,
                 portfolio_weights=portfolio_weights,
                 realized_costs=realized_costs
             )
-            
-        return {
+        
+            return {
                 'returns': portfolio_returns.to_frame('returns'),
                 'weights': portfolio_weights,
                 'metrics_history': optimization_metrics,
-                'parameters_history': parameters_history,
                 'realized_costs': realized_costs.to_frame('costs'),
-                'backtest_metrics': pd.DataFrame.from_dict(metrics, orient='index', columns=['value'])  # Changed this line
+                'backtest_metrics': pd.DataFrame.from_dict(metrics, orient='index', columns=['value'])
             }
 
     def save_backtest_results(self, results: Dict[str, Union[pd.Series, pd.DataFrame]], 
@@ -1663,26 +1661,28 @@ class RobustBacktestOptimizer(RobustPortfolioOptimizer):
         portfolio_weights: pd.DataFrame,
         realized_costs: pd.Series
     ) -> Dict[str, float]:
-        """Calculate key backtest metrics with standardized keys"""
+        """Calculate key backtest metrics with proper array handling"""
         
-        # Clean data
-        portfolio_returns = portfolio_returns.fillna(0)
+        # Ensure inputs are properly formatted
+        portfolio_returns = portfolio_returns.fillna(0).astype(float)
+        portfolio_weights = portfolio_weights.fillna(0).astype(float)
+        realized_costs = realized_costs.fillna(0).astype(float)
         
-        # Calculate returns metrics
-        total_return = (1 + portfolio_returns).prod() - 1
-        ann_return = (1 + total_return) ** (12 / len(portfolio_returns)) - 1
-        volatility = portfolio_returns.std() * np.sqrt(12)
-        sharpe = (ann_return - self.risk_free_rate) / volatility if volatility > 0 else 0
+        # Calculate returns metrics (ensure scalar outputs)
+        total_return = float((1 + portfolio_returns).prod() - 1)
+        ann_return = float((1 + total_return) ** (12 / len(portfolio_returns)) - 1)
+        volatility = float(portfolio_returns.std() * np.sqrt(12))
+        sharpe = float((ann_return - self.risk_free_rate) / volatility if volatility > 0 else 0)
         
         # Calculate drawdowns
         cumulative = (1 + portfolio_returns).cumprod()
         rolling_max = cumulative.expanding().max()
         drawdowns = cumulative / rolling_max - 1
-        max_drawdown = drawdowns.min()
+        max_drawdown = float(drawdowns.min())
         
         # Calculate cost metrics
-        total_costs = realized_costs.sum()
-        turnover = portfolio_weights.diff().abs().sum(axis=1).mean()
+        total_costs = float(realized_costs.sum())
+        turnover = float(portfolio_weights.diff().abs().sum(axis=1).mean())
         
         return {
             'Total Return': total_return,

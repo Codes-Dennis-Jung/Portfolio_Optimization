@@ -241,89 +241,100 @@ def test_multi_asset_backtest():
                 bounds=(0.05, 0.4)  # 5% min, 40% max per asset class
             )
     
-    # Initialize backtester
-    print("\nStep 4: Initializing backtester...")
-    backtester = RobustBacktestOptimizer(
-        returns=returns,
-        lookback_window=36,           # 3 years
-        rebalance_frequency=3,        # Quarterly
-        estimation_method='robust',    # Use robust estimation
-        transaction_cost=0.001,       # 10bps per trade
-        risk_free_rate=universe_data['risk_free_rate'],
-        epsilon=0.1                   # Uncertainty parameter
-    )
-    
-    # Define portfolio constraints
+    # Initialize base constraints with adjusted box constraints
     constraints = OptimizationConstraints(
         long_only=True,
-        box_constraints={i: (0.0, 0.5) for i in range(len(returns.columns))},  # Max 50% per asset
+        box_constraints={i: (0.0, 0.3) for i in range(len(returns.columns))},  # Max 30% per asset
         group_constraints=group_constraints
     )
     
-    # Define strategies to test
+    # Define strategies with adjusted parameters
     strategies = [
         (ObjectiveFunction.MINIMUM_VARIANCE, "Minimum Variance", {}),
-        (ObjectiveFunction.GARLAPPI_ROBUST, "Garlappi Robust", {'epsilon': 0.1}),
+        (ObjectiveFunction.GARLAPPI_ROBUST, "Garlappi Robust", {
+            'epsilon': 0.1,  # Uncertainty parameter
+            'alpha': np.ones(len(returns.columns)),  # Asset-specific risk aversion
+            'omega_method': 'bayes'  # Estimation method for Omega
+        }),
         (ObjectiveFunction.MEAN_VARIANCE, "Mean Variance", {}),
         (ObjectiveFunction.MAXIMUM_DIVERSIFICATION, "Maximum Diversification", {})
     ]
     
-    print("\nStep 5: Running backtests...")
+    print("\nStep 4: Running backtests...")
     results = {}
     successful_strategies = []
     
     for objective, name, params in strategies:
         print(f"\nTesting {name} strategy...")
         try:
+            # Create separate backtester for each strategy
+            backtester = RobustBacktestOptimizer(
+                returns=returns,
+                lookback_window=36,           # 3 years
+                rebalance_frequency=3,        # Quarterly
+                estimation_method='robust',    # Use robust estimation
+                transaction_cost=0.001,       # 10bps per trade
+                risk_free_rate=universe_data['risk_free_rate'],
+                epsilon=params.get('epsilon', 0.1)  # Get epsilon from params if exists
+            )
+            
             # Initialize with equal weights
             initial_weights = np.ones(len(returns.columns)) / len(returns.columns)
             
-            # Run backtest
-            strategy_result = backtester.run_backtest(
-                objective=objective,
-                constraints=constraints,
-                initial_weights=initial_weights,
-                **params
-            )
-            
-            # Save results
-            filename = f"{name.replace(' ', '_')}_results.xlsx"
-            backtester.save_backtest_results(strategy_result, filename)
-            print(f"Results saved to {filename}")
-            
-            # Print strategy summary with corrected metrics access
-            metrics_df = strategy_result['backtest_metrics']
-            print(f"\n{name} Performance Summary:")
-            # Convert Series to float before formatting
-            print(f"Total Return: {float(metrics_df.loc['Total Return', 'value']):.2%}")
-            print(f"Annualized Return: {float(metrics_df.loc['Annualized Return', 'value']):.2%}")
-            print(f"Volatility: {float(metrics_df.loc['Volatility', 'value']):.2%}")
-            print(f"Sharpe Ratio: {float(metrics_df.loc['Sharpe Ratio', 'value']):.2f}")
-            print(f"Maximum Drawdown: {float(metrics_df.loc['Maximum Drawdown', 'value']):.2%}")
-            print(f"Average Turnover: {float(metrics_df.loc['Average Turnover', 'value']):.2%}")
-            print(f"Total Costs: {float(metrics_df.loc['Total Costs', 'value']):.2%}")
-            
-            # Store results
-            results[name] = strategy_result
-            successful_strategies.append(name)
-            
-            # Print asset class exposures
-            weights = strategy_result['weights'].mean()
-            print("\nAverage Asset Class Exposures:")
-            for asset_class in asset_classes:
-                exposure = sum(
-                    weights[symbol] for symbol in weights.index
-                    if asset_mapping[symbol]['class'] == asset_class
+            # Run backtest with adjusted error handling
+            try:
+                strategy_result = backtester.run_backtest(
+                    objective=objective,
+                    constraints=constraints,
+                    initial_weights=initial_weights,
+                    **params
                 )
-                print(f"{asset_class}: {exposure:.1%}")
-            
+                
+                # Save results
+                filename = f"{name.replace(' ', '_')}_results.xlsx"
+                backtester.save_backtest_results(strategy_result, filename)
+                print(f"Results saved to {filename}")
+                
+                # Print strategy summary
+                metrics_df = strategy_result['backtest_metrics']
+                print(f"\n{name} Performance Summary:")
+                print(f"Total Return: {float(metrics_df.loc['Total Return', 'value']):.2%}")
+                print(f"Annualized Return: {float(metrics_df.loc['Annualized Return', 'value']):.2%}")
+                print(f"Volatility: {float(metrics_df.loc['Volatility', 'value']):.2%}")
+                print(f"Sharpe Ratio: {float(metrics_df.loc['Sharpe Ratio', 'value']):.2f}")
+                print(f"Maximum Drawdown: {float(metrics_df.loc['Maximum Drawdown', 'value']):.2%}")
+                print(f"Average Turnover: {float(metrics_df.loc['Average Turnover', 'value']):.2%}")
+                print(f"Total Costs: {float(metrics_df.loc['Total Costs', 'value']):.2%}")
+                
+                # Store results
+                results[name] = strategy_result
+                successful_strategies.append(name)
+                
+                # Print asset class exposures with error handling
+                weights = strategy_result['weights'].mean()
+                print("\nAverage Asset Class Exposures:")
+                for asset_class in asset_classes:
+                    try:
+                        exposure = sum(
+                            weights[symbol] for symbol in weights.index
+                            if asset_mapping[symbol]['class'] == asset_class
+                        )
+                        print(f"{asset_class}: {exposure:.1%}")
+                    except Exception as e:
+                        print(f"Error calculating exposure for {asset_class}: {str(e)}")
+                        
+            except Exception as e:
+                print(f"Error in backtest for {name}: {str(e)}")
+                import traceback
+                print(traceback.format_exc())
+                
         except Exception as e:
-            print(f"Error testing {name} strategy: {str(e)}")
+            print(f"Error initializing {name} strategy: {str(e)}")
             import traceback
             print(traceback.format_exc())
     
     if successful_strategies:
-        print("\nStep 6: Analyzing results...")
+        print("\nStep 5: Analyzing results...")
         try:
             # Compare strategies
             comparison = analyze_strategy_results(
@@ -335,7 +346,7 @@ def test_multi_asset_backtest():
             print(comparison.round(3))
             
             # Plot results
-            print("\nStep 7: Generating visualizations...")
+            print("\nStep 6: Generating visualizations...")
             plot_strategy_comparison(
                 {k: results[k] for k in successful_strategies},
                 universe_data
