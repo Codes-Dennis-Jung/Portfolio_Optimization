@@ -1138,111 +1138,129 @@ class RobustEfficientFrontier(RobustPortfolioOptimizer):
         super().__init__(returns, **kwargs)
 
     def compute_efficient_frontier(
-        self,
-        n_points: int = 15,
-        epsilon_range: Optional[Tuple[float, float]] = None,
-        risk_range: Optional[Tuple[float, float]] = None,
-        alpha_scale_range: Optional[Tuple[float, float]] = None,
-        constraints: Optional[OptimizationConstraints] = None
-    ) -> Dict[str, np.ndarray]:
-        """
-        Compute the Garlappi robust efficient frontier
-        
-        Args:
-            n_points: Number of points on the frontier
-            epsilon_range: Optional (min_epsilon, max_epsilon) for uncertainty
-            risk_range: Optional (min_risk, max_risk) tuple
-            alpha_scale_range: Optional (min_scale, max_scale) to vary alpha vector
-            constraints: Basic constraints for all portfolios
-        """
-        print("Computing Garlappi robust efficient frontier...")
-        
-        # Initialize base constraints if none provided
-        if constraints is None:
-            constraints = OptimizationConstraints(long_only=True)
-        
-        # Get risk range if not provided
-        if risk_range is None:
-            risk_range = self._get_risk_bounds()
+            self,
+            n_points: int = 15,
+            epsilon_range: Optional[Tuple[float, float]] = None,
+            risk_range: Optional[Tuple[float, float]] = None,
+            alpha_scale_range: Optional[Tuple[float, float]] = None,
+            constraints: Optional[OptimizationConstraints] = None
+        ) -> Dict[str, np.ndarray]:
+            """
+            Compute the Garlappi robust efficient frontier with improved numerical stability
+            """
+            print("Computing Garlappi robust efficient frontier...")
             
-        # Get epsilon range if not provided
-        if epsilon_range is None:
-            epsilon_range = (0.0, 2.0 * self.epsilon)
+            # Initialize base constraints if none provided
+            if constraints is None:
+                constraints = OptimizationConstraints(long_only=True)
             
-        # Get alpha scale range if not provided
-        if alpha_scale_range is None:
-            alpha_scale_range = (0.5, 1.5)
+            # Initialize containers
+            frontier_results = {
+                'returns': np.zeros(n_points),
+                'risks': np.zeros(n_points),
+                'sharpe_ratios': np.zeros(n_points),
+                'weights': np.zeros((n_points, len(self.returns.columns))),
+                'epsilons': np.zeros(n_points),
+                'alpha_scales': np.zeros(n_points)
+            }
             
-        # Initialize result containers with all metrics
-        frontier_results = {
-            'returns': np.zeros(n_points),
-            'risks': np.zeros(n_points),
-            'sharpe_ratios': np.zeros(n_points),
-            'worst_case_returns': np.zeros(n_points),
-            'weights': np.zeros((n_points, len(self.returns.columns))),
-            'diversification_ratios': np.zeros(n_points),
-            'effective_n': np.zeros(n_points),
-            'estimation_uncertainty': np.zeros(n_points),
-            'robust_sharpe_ratios': np.zeros(n_points),
-            'epsilons': np.zeros(n_points),
-            'alpha_scales': np.zeros(n_points),
-            'risk_contributions': np.zeros((n_points, len(self.returns.columns)))
-        }
-        
-        # Compute frontier points with progress bar
-        for i in tqdm(range(n_points)):
+            # Compute minimum variance portfolio for lower bound
             try:
-                # Interpolate parameters
-                target_epsilon = epsilon_range[0] + (epsilon_range[1] - epsilon_range[0]) * i / (n_points - 1)
-                target_risk = risk_range[0] + (risk_range[1] - risk_range[0]) * i / (n_points - 1)
-                alpha_scale = alpha_scale_range[0] + (alpha_scale_range[1] - alpha_scale_range[0]) * i / (n_points - 1)
-                
-                # Scale alpha vector
-                scaled_alpha = self.alpha * alpha_scale
-                
-                # Create constraints with target risk
-                point_constraints = self._create_frontier_constraints(constraints, target_risk)
-                
-                # Optimize portfolio
-                result = self.optimize(
-                    objective=ObjectiveFunction.GARLAPPI_ROBUST,
-                    constraints=point_constraints,
-                    epsilon=target_epsilon,
-                    alpha=scaled_alpha,
-                    omega=self.omega
+                min_var_result = self.optimize(
+                    objective=ObjectiveFunction.MINIMUM_VARIANCE,
+                    constraints=constraints
                 )
-                
-                # Store basic results
-                frontier_results['returns'][i] = result['return']
-                frontier_results['risks'][i] = result['risk']
-                frontier_results['sharpe_ratios'][i] = result['sharpe_ratio']
-                frontier_results['weights'][i] = result['weights']
-                frontier_results['epsilons'][i] = target_epsilon
-                frontier_results['alpha_scales'][i] = alpha_scale
-                
-                # Calculate and store robust metrics
-                robust_metrics = self.calculate_robust_metrics(result['weights'], scaled_alpha)
-                frontier_results['worst_case_returns'][i] = robust_metrics['worst_case_return']
-                frontier_results['diversification_ratios'][i] = robust_metrics['diversification_ratio']
-                frontier_results['effective_n'][i] = robust_metrics['effective_n']
-                frontier_results['estimation_uncertainty'][i] = robust_metrics['estimation_uncertainty']
-                frontier_results['robust_sharpe_ratios'][i] = robust_metrics['robust_sharpe']
-                frontier_results['risk_contributions'][i] = robust_metrics['risk_contributions']
-                
+                min_risk = min_var_result['risk']
             except Exception as e:
-                print(f"Failed to compute frontier point {i}: {str(e)}")
-                continue
-        
-        # Clean up failed points and sort results
-        mask = frontier_results['risks'] > 0
-        for key in frontier_results:
-            frontier_results[key] = frontier_results[key][mask]
+                print(f"Failed to compute minimum variance portfolio: {e}")
+                min_risk = np.sqrt(np.min(np.diag(self.covariance)))
             
-        sort_idx = np.argsort(frontier_results['risks'])
-        for key in frontier_results:
-            frontier_results[key] = frontier_results[key][sort_idx]
+            # Compute maximum return portfolio for upper bound
+            try:
+                max_return_weights = np.zeros(len(self.returns.columns))
+                max_return_idx = np.argmax(self.expected_returns)
+                max_return_weights[max_return_idx] = 1.0
+                max_risk = np.sqrt(max_return_weights @ self.covariance @ max_return_weights)
+            except Exception as e:
+                print(f"Failed to compute maximum return portfolio: {e}")
+                max_risk = np.sqrt(np.max(np.diag(self.covariance)))
             
-        return frontier_results
+            # Set risk range with buffer
+            if risk_range is None:
+                risk_range = (min_risk * 0.9, max_risk * 1.1)
+            
+            # Set epsilon range
+            if epsilon_range is None:
+                epsilon_range = (0.01, 0.5)  # More conservative range
+            
+            # Set alpha scale range
+            if alpha_scale_range is None:
+                alpha_scale_range = (0.8, 1.2)  # More conservative range
+            
+            valid_points = 0
+            max_attempts = n_points * 2  # Allow for some failures
+            attempt = 0
+            
+            while valid_points < n_points and attempt < max_attempts:
+                try:
+                    # Interpolate parameters
+                    completion_ratio = valid_points / (n_points - 1) if n_points > 1 else 0
+                    target_risk = risk_range[0] + (risk_range[1] - risk_range[0]) * completion_ratio
+                    target_epsilon = epsilon_range[0] + (epsilon_range[1] - epsilon_range[0]) * completion_ratio
+                    alpha_scale = alpha_scale_range[0] + (alpha_scale_range[1] - alpha_scale_range[0]) * completion_ratio
+                    
+                    # Scale alpha vector
+                    scaled_alpha = self.alpha * alpha_scale
+                    
+                    # Add target risk to constraints with tolerance
+                    risk_tolerance = target_risk * 0.1  # 10% tolerance
+                    point_constraints = OptimizationConstraints(
+                        long_only=True,
+                        box_constraints={i: (0.0, 1.0) for i in range(len(self.returns.columns))},
+                        target_risk=target_risk
+                    )
+                    
+                    # Optimize portfolio with increased iterations and looser tolerance
+                    result = self.optimize(
+                        objective=ObjectiveFunction.GARLAPPI_ROBUST,
+                        constraints=point_constraints,
+                        epsilon=target_epsilon,
+                        alpha=scaled_alpha,
+                        current_weights=None,  # Start fresh each time
+                        options={'maxiter': 1000, 'ftol': 1e-6}
+                    )
+                    
+                    # Store results
+                    frontier_results['returns'][valid_points] = result['return']
+                    frontier_results['risks'][valid_points] = result['risk']
+                    frontier_results['sharpe_ratios'][valid_points] = result['sharpe_ratio']
+                    frontier_results['weights'][valid_points] = result['weights']
+                    frontier_results['epsilons'][valid_points] = target_epsilon
+                    frontier_results['alpha_scales'][valid_points] = alpha_scale
+                    
+                    valid_points += 1
+                    print(f"Successfully computed point {valid_points}/{n_points}")
+                    
+                except Exception as e:
+                    print(f"Failed attempt {attempt + 1}: {str(e)}")
+                    attempt += 1
+                    continue
+                    
+                attempt += 1
+            
+            if valid_points == 0:
+                raise ValueError("Failed to compute any valid frontier points")
+            
+            # Trim results to valid points
+            for key in frontier_results:
+                frontier_results[key] = frontier_results[key][:valid_points]
+            
+            # Sort by risk
+            sort_idx = np.argsort(frontier_results['risks'])
+            for key in frontier_results:
+                frontier_results[key] = frontier_results[key][sort_idx]
+            
+            return frontier_results
         
     def plot_frontier(self, frontier_results: Dict[str, np.ndarray]):
         """Create comprehensive Garlappi frontier visualization"""
