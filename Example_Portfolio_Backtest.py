@@ -1,7 +1,11 @@
+
 import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
 import seaborn as sns
 import os
-import matplotlib as plt
+import scipy.stats
+from typing import Dict,Tuple
 from PortOpt import *
 
 ################################################################################################################
@@ -201,15 +205,95 @@ def analyze_universe(data: Dict):
     return stats
 
 # Example usage
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-import seaborn as sns
-from typing import Dict, List, Optional, Tuple, Union
-from PortOpt import *
+def plot_strategy_comparison(
+    results: Dict[str, Dict],
+    universe_data: Dict,
+    figsize: Tuple[int, int] = (20, 10),
+    output_dir: str = r'Output_Backtest'
+):
+    """Create visualization of cumulative returns and drawdowns and save to file"""
+    import datetime
+    import os
+    from matplotlib.dates import YearLocator, DateFormatter
+    
+    # Create output directory if it doesn't exist
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        print(f"Created output directory: {output_dir}")
+    
+    # Create figure for plots
+    fig = plt.figure(figsize=figsize)
+    gs = plt.GridSpec(2, 1)
+    
+    # Helper function to filter valid dates
+    def get_valid_dates(index):
+        return pd.DatetimeIndex([x for x in index if isinstance(x, (pd.Timestamp, datetime.datetime))])
+    
+    # 1. Cumulative Returns
+    ax1 = fig.add_subplot(gs[0])
+    for strategy_name, result in results.items():
+        try:
+            returns = result['returns']['returns']
+            valid_dates = get_valid_dates(returns.index)
+            cumulative = (1 + returns.loc[valid_dates]).cumprod()
+            ax1.plot(cumulative.index, cumulative.values, label=strategy_name, linewidth=2)
+            
+            # Save cumulative returns data to Excel
+            excel_path = os.path.join(output_dir, f"{strategy_name.replace(' ', '_')}_cumulative_returns.xlsx")
+            cumulative.to_excel(excel_path)
+            print(f"Saved cumulative returns to: {excel_path}")
+        except Exception as e:
+            print(f"Error plotting cumulative returns for {strategy_name}: {str(e)}")
+    ax1.set_title('Cumulative Strategy Returns')
+    ax1.legend(loc='upper left')
+    ax1.grid(True)
+    
+    # 2. Drawdowns
+    ax2 = fig.add_subplot(gs[1])
+    for strategy_name, result in results.items():
+        try:
+            returns = result['returns']['returns']
+            valid_dates = get_valid_dates(returns.index)
+            returns_clean = returns.loc[valid_dates]
+            
+            cum_returns = (1 + returns_clean).cumprod()
+            rolling_max = cum_returns.expanding().max()
+            drawdowns = (cum_returns - rolling_max) / rolling_max
+            
+            ax2.plot(drawdowns.index, drawdowns.values, label=strategy_name)
+            
+            # Save drawdowns data to Excel
+            excel_path = os.path.join(output_dir, f"{strategy_name.replace(' ', '_')}_drawdowns.xlsx")
+            drawdowns.to_excel(excel_path)
+            print(f"Saved drawdowns to: {excel_path}")
+        except Exception as e:
+            print(f"Error plotting drawdowns for {strategy_name}: {str(e)}")
+    ax2.set_title('Strategy Drawdowns')
+    ax2.legend(loc='lower left')
+    ax2.grid(True)
+    
+    # Format date axes
+    for ax in [ax1, ax2]:
+        ax.xaxis.set_major_locator(YearLocator())
+        ax.xaxis.set_major_formatter(DateFormatter('%Y'))
+        plt.setp(ax.get_xticklabels(), rotation=45)
+    
+    plt.tight_layout()
+    
+    # Save plot to file
+    plot_path = os.path.join(output_dir, 'strategy_comparison_plots.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    print(f"Saved plots to: {plot_path}")
+    
+    plt.show()
 
 def test_multi_asset_backtest():
     """Test multi-asset portfolio optimization backtest"""
+    # Create output directory
+    output_dir = r'Output_Backtest'
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+    
     # Step 1: Load and analyze universe data
     print("Step 1: Loading and analyzing universe data...")
     universe_data = get_multi_asset_test_data()
@@ -241,14 +325,14 @@ def test_multi_asset_backtest():
                 bounds=(0.05, 0.4)  # 5% min, 40% max per asset class
             )
     
-    # Initialize base constraints with adjusted box constraints
+    # Initialize base constraints
     constraints = OptimizationConstraints(
         long_only=True,
-        box_constraints={i: (0.0, 0.3) for i in range(len(returns.columns))},  # Max 30% per asset
+        box_constraints={i: (0.0, 0.3) for i in range(len(returns.columns))},
         group_constraints=group_constraints
     )
     
-    # Define strategies with adjusted parameters
+    # Define strategies
     strategies = [
         (ObjectiveFunction.MINIMUM_VARIANCE, "Minimum Variance", {}),
         (ObjectiveFunction.GARLAPPI_ROBUST, "Garlappi Robust", {
@@ -257,7 +341,14 @@ def test_multi_asset_backtest():
             'omega_method': 'bayes'  # Estimation method for Omega
         }),
         (ObjectiveFunction.MEAN_VARIANCE, "Mean Variance", {}),
-        (ObjectiveFunction.MAXIMUM_DIVERSIFICATION, "Maximum Diversification", {})
+        (ObjectiveFunction.MAXIMUM_DIVERSIFICATION, "Maximum Diversification", {}),
+        (ObjectiveFunction.ROBUST_MEAN_VARIANCE, "Robust Mean-Variance",  {
+            'epsilon': 0.1, 'kappa': 1.0}),
+        (ObjectiveFunction.MAXIMUM_SHARPE, "Maximum Sharpe", {}),
+        (ObjectiveFunction.RISK_PARITY, "Risk Parity", {}),
+        (ObjectiveFunction.MEAN_CVAR, "Mean-CVaR", {}),
+        (ObjectiveFunction.HIERARCHICAL_RISK_PARITY, "Hierarchical Risk Parity", {}),
+        (ObjectiveFunction.EQUAL_RISK_CONTRIBUTION, "Equal Risk Contribution", {})
     ]
     
     print("\nStep 4: Running backtests...")
@@ -267,21 +358,18 @@ def test_multi_asset_backtest():
     for objective, name, params in strategies:
         print(f"\nTesting {name} strategy...")
         try:
-            # Create separate backtester for each strategy
             backtester = RobustBacktestOptimizer(
                 returns=returns,
-                lookback_window=36,           # 3 years
-                rebalance_frequency=3,        # Quarterly
-                estimation_method='robust',    # Use robust estimation
-                transaction_cost=0.001,       # 10bps per trade
+                lookback_window=36,
+                rebalance_frequency=1,
+                estimation_method='robust',
+                transaction_cost=0.001,
                 risk_free_rate=universe_data['risk_free_rate'],
-                epsilon=params.get('epsilon', 0.1)  # Get epsilon from params if exists
+                epsilon=params.get('epsilon', 0.1)
             )
             
-            # Initialize with equal weights
             initial_weights = np.ones(len(returns.columns)) / len(returns.columns)
             
-            # Run backtest with adjusted error handling
             try:
                 strategy_result = backtester.run_backtest(
                     objective=objective,
@@ -290,161 +378,53 @@ def test_multi_asset_backtest():
                     **params
                 )
                 
-                # Save results
-                filename = f"{name.replace(' ', '_')}_results.xlsx"
+                # Save results with proper path joining
+                filename = os.path.join(output_dir, f"{name.replace(' ', '_')}_results.xlsx")
                 backtester.save_backtest_results(strategy_result, filename)
-                print(f"Results saved to {filename}")
+                print(f"Results saved to: {filename}")
                 
                 # Print strategy summary
                 metrics_df = strategy_result['backtest_metrics']
                 print(f"\n{name} Performance Summary:")
-                print(f"Total Return: {float(metrics_df.loc['Total Return', 'value']):.2%}")
-                print(f"Annualized Return: {float(metrics_df.loc['Annualized Return', 'value']):.2%}")
-                print(f"Volatility: {float(metrics_df.loc['Volatility', 'value']):.2%}")
-                print(f"Sharpe Ratio: {float(metrics_df.loc['Sharpe Ratio', 'value']):.2f}")
-                print(f"Maximum Drawdown: {float(metrics_df.loc['Maximum Drawdown', 'value']):.2%}")
-                print(f"Average Turnover: {float(metrics_df.loc['Average Turnover', 'value']):.2%}")
-                print(f"Total Costs: {float(metrics_df.loc['Total Costs', 'value']):.2%}")
+                for metric in ['Total Return', 'Annualized Return', 'Volatility', 'Sharpe Ratio', 
+                             'Maximum Drawdown', 'Average Turnover', 'Total Costs']:
+                    print(f"{metric}: {float(metrics_df.loc[metric, 'value']):.2%}")
                 
-                # Store results
                 results[name] = strategy_result
                 successful_strategies.append(name)
                 
-                # Print asset class exposures with error handling
-                weights = strategy_result['weights'].mean()
-                print("\nAverage Asset Class Exposures:")
-                for asset_class in asset_classes:
-                    try:
-                        exposure = sum(
-                            weights[symbol] for symbol in weights.index
-                            if asset_mapping[symbol]['class'] == asset_class
-                        )
-                        print(f"{asset_class}: {exposure:.1%}")
-                    except Exception as e:
-                        print(f"Error calculating exposure for {asset_class}: {str(e)}")
-                        
             except Exception as e:
                 print(f"Error in backtest for {name}: {str(e)}")
-                import traceback
                 print(traceback.format_exc())
                 
         except Exception as e:
             print(f"Error initializing {name} strategy: {str(e)}")
-            import traceback
             print(traceback.format_exc())
     
     if successful_strategies:
-        print("\nStep 5: Analyzing results...")
+        print("\nStep 5: Generating visualizations and saving results...")
         try:
-            # Compare strategies
-            comparison = analyze_strategy_results(
-                {k: results[k] for k in successful_strategies},
-                asset_mapping
-            )
-            
-            print("\nStrategy Comparison Summary:")
-            print(comparison.round(3))
-            
-            # Plot results
-            print("\nStep 6: Generating visualizations...")
+            # Plot and save results
             plot_strategy_comparison(
                 {k: results[k] for k in successful_strategies},
-                universe_data
+                universe_data,
+                output_dir=output_dir
             )
             
             return {
                 'results': results,
-                'comparison': comparison,
                 'universe_data': universe_data,
                 'universe_stats': universe_stats
             }
             
         except Exception as e:
-            print(f"Error in analysis: {str(e)}")
-            import traceback
+            print(f"Error in visualization: {str(e)}")
             print(traceback.format_exc())
             return None
     else:
         print("No strategies completed successfully.")
         return None
-
-def analyze_strategy_results(
-    results: Dict[str, Dict],
-    asset_mapping: Dict[str, Dict]
-) -> pd.DataFrame:
-    """
-    Analyze and compare strategy performance
     
-    Args:
-        results: Dictionary of strategy results
-        asset_mapping: Asset class mapping information
-        
-    Returns:
-        DataFrame with strategy performance metrics
-    """
-    summary = pd.DataFrame()
-    
-    for strategy_name, result in results.items():
-        # Get metrics from backtest_metrics DataFrame
-        metrics_df = result['backtest_metrics']
-        
-        # Basic metrics
-        summary.loc[strategy_name, 'Total Return'] = float(metrics_df.loc['Total Return', 'value'])
-        summary.loc[strategy_name, 'Annualized Return'] = float(metrics_df.loc['Annualized Return', 'value'])
-        summary.loc[strategy_name, 'Volatility'] = float(metrics_df.loc['Volatility', 'value'])
-        summary.loc[strategy_name, 'Sharpe Ratio'] = float(metrics_df.loc['Sharpe Ratio', 'value'])
-        summary.loc[strategy_name, 'Maximum Drawdown'] = float(metrics_df.loc['Maximum Drawdown', 'value'])
-        summary.loc[strategy_name, 'Average Turnover'] = float(metrics_df.loc['Average Turnover', 'value'])
-        summary.loc[strategy_name, 'Total Costs'] = float(metrics_df.loc['Total Costs', 'value'])
-        
-        # Calculate asset class exposures
-        weights_df = result['weights']
-        avg_weights = weights_df.mean()
-        
-        for asset_class in set(info['class'] for info in asset_mapping.values()):
-            class_weight = sum(
-                avg_weights[symbol] 
-                for symbol in avg_weights.index
-                if asset_mapping[symbol]['class'] == asset_class
-            )
-            summary.loc[strategy_name, f'{asset_class} Exposure'] = float(class_weight)
-        
-        # Additional risk metrics
-        returns_series = result['returns']['returns']
-        
-        # Calculate rolling metrics (36-month window)
-        window = 36
-        rolling_ret = returns_series.rolling(window=window).mean() * 12
-        rolling_vol = returns_series.rolling(window=window).std() * np.sqrt(12)
-        
-        # Average metrics
-        summary.loc[strategy_name, 'Avg Rolling Return'] = rolling_ret.mean()
-        summary.loc[strategy_name, 'Avg Rolling Vol'] = rolling_vol.mean()
-        
-        # Risk metrics
-        returns_array = returns_series.values
-        summary.loc[strategy_name, 'Skewness'] = scipy.stats.skew(returns_array)
-        summary.loc[strategy_name, 'Kurtosis'] = scipy.stats.kurtosis(returns_array)
-        
-        # Downside risk
-        negative_returns = returns_array[returns_array < 0]
-        if len(negative_returns) > 0:
-            summary.loc[strategy_name, 'Downside Vol'] = np.std(negative_returns) * np.sqrt(12)
-            summary.loc[strategy_name, 'Max Monthly Loss'] = np.min(returns_array)
-        else:
-            summary.loc[strategy_name, 'Downside Vol'] = 0
-            summary.loc[strategy_name, 'Max Monthly Loss'] = 0
-            
-        # Calculate drawdown statistics
-        cum_returns = (1 + returns_series).cumprod()
-        rolling_max = cum_returns.expanding().max()
-        drawdowns = (cum_returns - rolling_max) / rolling_max
-        
-        summary.loc[strategy_name, 'Avg Drawdown'] = drawdowns.mean()
-        summary.loc[strategy_name, 'Drawdown Duration'] = calculate_avg_drawdown_duration(drawdowns)
-        
-    return summary
-
 def calculate_avg_drawdown_duration(drawdowns: pd.Series) -> float:
     """Calculate average drawdown duration in months"""
     if drawdowns.empty:
@@ -471,87 +451,198 @@ def calculate_avg_drawdown_duration(drawdowns: pd.Series) -> float:
 def plot_strategy_comparison(
     results: Dict[str, Dict],
     universe_data: Dict,
-    figsize: Tuple[int, int] = (20, 15)
+    figsize: Tuple[int, int] = (20, 10),
+    output_dir: str = r'Output_Backtest'
 ):
-    """Create comprehensive visualization of strategy comparison"""
+    """Create visualization of cumulative returns and drawdowns and save to file"""
+    import datetime
+    import os
+    from matplotlib.dates import YearLocator, DateFormatter
+    
+    # Create output directory if it doesn't exist
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        print(f"Created output directory: {output_dir}")
+    
+    # Create figure for plots
     fig = plt.figure(figsize=figsize)
-    gs = plt.GridSpec(3, 2)
+    gs = plt.GridSpec(2, 1)
+    
+    # Helper function to filter valid dates
+    def get_valid_dates(index):
+        return pd.DatetimeIndex([x for x in index if isinstance(x, (pd.Timestamp, datetime.datetime))])
     
     # 1. Cumulative Returns
-    ax1 = fig.add_subplot(gs[0, :])
+    ax1 = fig.add_subplot(gs[0])
     for strategy_name, result in results.items():
-        cumulative = (1 + result['returns']['returns']).cumprod()
-        ax1.plot(cumulative.index, cumulative.values, label=strategy_name, linewidth=2)
+        try:
+            returns = result['returns']['returns']
+            valid_dates = get_valid_dates(returns.index)
+            cumulative = (1 + returns.loc[valid_dates]).cumprod()
+            ax1.plot(cumulative.index, cumulative.values, label=strategy_name, linewidth=2)
+            
+            # Save cumulative returns data to Excel
+            excel_path = os.path.join(output_dir, f"{strategy_name.replace(' ', '_')}_cumulative_returns.xlsx")
+            cumulative.to_excel(excel_path)
+            print(f"Saved cumulative returns to: {excel_path}")
+        except Exception as e:
+            print(f"Error plotting cumulative returns for {strategy_name}: {str(e)}")
     ax1.set_title('Cumulative Strategy Returns')
     ax1.legend(loc='upper left')
     ax1.grid(True)
     
-    # 2. Rolling Volatility
-    ax2 = fig.add_subplot(gs[1, 0])
-    window = 36  # 3-year rolling window
+    # 2. Drawdowns
+    ax2 = fig.add_subplot(gs[1])
     for strategy_name, result in results.items():
-        rolling_vol = result['returns']['returns'].rolling(window).std() * np.sqrt(12)
-        ax2.plot(rolling_vol.index, rolling_vol.values, label=strategy_name)
-    ax2.set_title('Rolling 3-Year Volatility')
-    ax2.legend(loc='upper left')
+        try:
+            returns = result['returns']['returns']
+            valid_dates = get_valid_dates(returns.index)
+            returns_clean = returns.loc[valid_dates]
+            
+            cum_returns = (1 + returns_clean).cumprod()
+            rolling_max = cum_returns.expanding().max()
+            drawdowns = (cum_returns - rolling_max) / rolling_max
+            
+            ax2.plot(drawdowns.index, drawdowns.values, label=strategy_name)
+            
+            # Save drawdowns data to Excel
+            excel_path = os.path.join(output_dir, f"{strategy_name.replace(' ', '_')}_drawdowns.xlsx")
+            drawdowns.to_excel(excel_path)
+            print(f"Saved drawdowns to: {excel_path}")
+        except Exception as e:
+            print(f"Error plotting drawdowns for {strategy_name}: {str(e)}")
+    ax2.set_title('Strategy Drawdowns')
+    ax2.legend(loc='lower left')
     ax2.grid(True)
     
-    # 3. Rolling Sharpe Ratio
-    ax3 = fig.add_subplot(gs[1, 1])
-    rf_rate = universe_data['risk_free_rate']
-    for strategy_name, result in results.items():
-        returns = result['returns']['returns']
-        rolling_ret = returns.rolling(window).mean() * 12
-        rolling_vol = returns.rolling(window).std() * np.sqrt(12)
-        rolling_sharpe = (rolling_ret - rf_rate * 12) / rolling_vol
-        ax3.plot(rolling_sharpe.index, rolling_sharpe.values, label=strategy_name)
-    ax3.set_title('Rolling 3-Year Sharpe Ratio')
-    ax3.legend(loc='upper left')
-    ax3.grid(True)
-    
-    # 4. Drawdowns
-    ax4 = fig.add_subplot(gs[2, 0])
-    for strategy_name, result in results.items():
-        returns = result['returns']['returns']
-        cum_returns = (1 + returns).cumprod()
-        rolling_max = cum_returns.expanding().max()
-        drawdowns = (cum_returns - rolling_max) / rolling_max
-        ax4.plot(drawdowns.index, drawdowns.values, label=strategy_name)
-    ax4.set_title('Strategy Drawdowns')
-    ax4.legend(loc='lower left')
-    ax4.grid(True)
-    
-    # 5. Asset Class Exposures
-    ax5 = fig.add_subplot(gs[2, 1])
-    exposures_data = []
-    strategy_names = []
-    asset_classes = sorted(set(info['class'] for info in universe_data['asset_mapping'].values()))
-    
-    for strategy_name, result in results.items():
-        weights = result['weights'].mean()
-        exposures = []
-        for asset_class in asset_classes:
-            exposure = sum(
-                weights[symbol] for symbol in weights.index
-                if universe_data['asset_mapping'][symbol]['class'] == asset_class
-            )
-            exposures.append(exposure)
-        exposures_data.append(exposures)
-        strategy_names.append(strategy_name)
-    
-    exposure_df = pd.DataFrame(
-        exposures_data,
-        columns=asset_classes,
-        index=strategy_names
-    )
-    
-    exposure_df.plot(kind='bar', stacked=True, ax=ax5)
-    ax5.set_title('Average Asset Class Exposures')
-    ax5.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
-    ax5.set_xticklabels(ax5.get_xticklabels(), rotation=45)
+    # Format date axes
+    for ax in [ax1, ax2]:
+        ax.xaxis.set_major_locator(YearLocator())
+        ax.xaxis.set_major_formatter(DateFormatter('%Y'))
+        plt.setp(ax.get_xticklabels(), rotation=45)
     
     plt.tight_layout()
+    
+    # Save plot to file
+    plot_path = os.path.join(output_dir, 'strategy_comparison_plots.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    print(f"Saved plots to: {plot_path}")
+    
     plt.show()
 
+def analyze_strategy_results(
+    results: Dict[str, Dict],
+    asset_mapping: Dict[str, Dict]
+) -> pd.DataFrame:
+    """
+    Analyze and compare strategy performance with improved error handling
+    """
+    summary = pd.DataFrame()
+    
+    for strategy_name, result in results.items():
+        try:
+            # Get metrics from backtest_metrics DataFrame
+            metrics_df = result['backtest_metrics']
+            
+            # Basic metrics with error handling
+            for metric in ['Total Return', 'Annualized Return', 'Volatility', 
+                        'Sharpe Ratio', 'Maximum Drawdown', 'Average Turnover', 
+                        'Total Costs']:
+                try:
+                    summary.loc[strategy_name, metric] = float(metrics_df.loc[metric, 'value'])
+                except Exception as e:
+                    print(f"Error calculating {metric} for {strategy_name}: {str(e)}")
+                    summary.loc[strategy_name, metric] = np.nan
+            
+            # Calculate asset class exposures
+            try:
+                weights_df = result['weights']
+                avg_weights = weights_df.mean()
+                
+                for asset_class in set(info['class'] for info in asset_mapping.values()):
+                    class_weight = sum(
+                        avg_weights[symbol] 
+                        for symbol in avg_weights.index
+                        if asset_mapping[symbol]['class'] == asset_class
+                    )
+                    summary.loc[strategy_name, f'{asset_class} Exposure'] = float(class_weight)
+            except Exception as e:
+                print(f"Error calculating exposures for {strategy_name}: {str(e)}")
+            
+            # Additional risk metrics
+            try:
+                returns_series = result['returns']['returns']
+                window = 36  # 3-year window
+                
+                rolling_ret = returns_series.rolling(window=window).mean() * 12
+                rolling_vol = returns_series.rolling(window=window).std() * np.sqrt(12)
+                
+                summary.loc[strategy_name, 'Avg Rolling Return'] = rolling_ret.mean()
+                summary.loc[strategy_name, 'Avg Rolling Vol'] = rolling_vol.mean()
+                
+                returns_array = returns_series.values
+                summary.loc[strategy_name, 'Skewness'] = scipy.stats.skew(returns_array)
+                summary.loc[strategy_name, 'Kurtosis'] = scipy.stats.kurtosis(returns_array)
+                
+                negative_returns = returns_array[returns_array < 0]
+                summary.loc[strategy_name, 'Downside Vol'] = np.std(negative_returns) * np.sqrt(12) if len(negative_returns) > 0 else 0
+                summary.loc[strategy_name, 'Max Monthly Loss'] = np.min(returns_array)
+                
+                # Drawdown statistics
+                cum_returns = (1 + returns_series).cumprod()
+                rolling_max = cum_returns.expanding().max()
+                drawdowns = (cum_returns - rolling_max) / rolling_max
+                
+                summary.loc[strategy_name, 'Avg Drawdown'] = drawdowns.mean()
+                summary.loc[strategy_name, 'Drawdown Duration'] = calculate_avg_drawdown_duration(drawdowns)
+            except Exception as e:
+                print(f"Error calculating risk metrics for {strategy_name}: {str(e)}")
+                
+        except Exception as e:
+            print(f"Error processing strategy {strategy_name}: {str(e)}")
+    
+    return summary
+
+def main():
+    # Set random seed for reproducibility
+    np.random.seed(42)
+    
+    # Set pandas display options for better output readability
+    pd.set_option('display.max_rows', 100)
+    pd.set_option('display.max_columns', 50)
+    pd.set_option('display.width', 1000)
+    pd.set_option('display.precision', 3)
+    
+    try:
+        print("Starting portfolio backtest...")
+        
+        # Run the backtest
+        results = test_multi_asset_backtest()
+        
+        if results is not None:
+            print("\nBacktest completed successfully!")
+            print(f"\nResults saved in: {os.path.abspath('Output_Backtest')}")
+            
+            # Print summary of available files
+            output_dir = 'Output_Backtest'
+            files = os.listdir(output_dir)
+            print("\nGenerated files:")
+            for file in files:
+                print(f"- {file}")
+                
+            # Print strategy names that were tested
+            if 'results' in results:
+                print("\nTested strategies:")
+                for strategy in results['results'].keys():
+                    print(f"- {strategy}")
+                    
+        else:
+            print("\nBacktest failed to complete.")
+            
+    except Exception as e:
+        print(f"\nError running backtest: {str(e)}")
+        import traceback
+        print(traceback.format_exc())
+
 if __name__ == "__main__":
-    test_results = test_multi_asset_backtest()
+    main()
