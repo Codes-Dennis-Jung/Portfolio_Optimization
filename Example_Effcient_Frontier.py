@@ -4,12 +4,9 @@ import matplotlib.pyplot as plt
 import seaborn as sns
 import yfinance as yf
 from datetime import datetime, timedelta
-from scipy.optimize import minimize
-from scipy.stats import norm
 from PortOpt import *
-from typing import Dict, List, Optional, Tuple, Union
-import warnings
-warnings.filterwarnings('ignore')
+from typing import Dict
+import os
 
 def get_multi_asset_test_data():
     """Get multi-asset universe data for testing"""
@@ -224,12 +221,18 @@ def analyze_efficient_frontier_results(frontier_results: Dict[str, np.ndarray],
                                     returns: pd.DataFrame,
                                     asset_mapping: Dict,
                                     epsilon: float):
-    """Create comprehensive visualization of efficient frontier results"""
+    """Create visualization of efficient frontier results with tracking error analysis"""
+    
+    # Create output directory if it doesn't exist
+    output_dir = 'Output_Efficient_Frontier'
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+        print(f"\nCreated output directory: {output_dir}")
     
     # Set up the plot grid
     plt.style.use('seaborn')
-    fig = plt.figure(figsize=(20, 15))
-    gs = plt.GridSpec(3, 2)
+    fig = plt.figure(figsize=(20, 8))
+    gs = plt.GridSpec(1, 3)
     
     # 1. Efficient Frontier Plot
     ax1 = fig.add_subplot(gs[0, 0])
@@ -240,11 +243,15 @@ def analyze_efficient_frontier_results(frontier_results: Dict[str, np.ndarray],
         cmap='viridis',
         s=100
     )
-    plt.colorbar(sc, ax=ax1, label='Robust Sharpe Ratio')
+    plt.colorbar(sc, ax=ax1, label='Sharpe Ratio')
     ax1.set_xlabel('Risk (Volatility)')
     ax1.set_ylabel('Expected Return')
     ax1.set_title(f'Robust Efficient Frontier (ε={epsilon:.2f})')
     ax1.grid(True, alpha=0.3)
+    
+    # Format axes as percentages
+    ax1.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: '{:.1%}'.format(x)))
+    ax1.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: '{:.1%}'.format(x)))
     
     # 2. Asset Allocation Evolution
     ax2 = fig.add_subplot(gs[0, 1])
@@ -269,223 +276,133 @@ def analyze_efficient_frontier_results(frontier_results: Dict[str, np.ndarray],
     ax2.set_title('Asset Class Allocation Evolution')
     ax2.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
     
-    # 3. Risk Decomposition
-    ax3 = fig.add_subplot(gs[1, 0])
+    # Format x-axis as percentage
+    ax2.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: '{:.1%}'.format(x)))
+    
+    # 3. Tracking Error Analysis
+    ax3 = fig.add_subplot(gs[0, 2])
+    sc2 = ax3.scatter(
+        frontier_results['tracking_errors'],
+        frontier_results['returns'],
+        c=frontier_results['sharpe_ratios'],
+        cmap='viridis',
+        s=100
+    )
+    plt.colorbar(sc2, ax=ax3, label='Sharpe Ratio')
+    ax3.set_xlabel('Tracking Error')
+    ax3.set_ylabel('Expected Return')
+    ax3.set_title('Return vs Tracking Error')
+    ax3.grid(True, alpha=0.3)
+    
+    # Format axes as percentages
+    ax3.xaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: '{:.1%}'.format(x)))
+    ax3.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, _: '{:.1%}'.format(x)))
+    
+    plt.tight_layout()
+    
+    # Save the plot
+    plot_path = os.path.join(output_dir, 'efficient_frontier_analysis.png')
+    plt.savefig(plot_path, dpi=300, bbox_inches='tight')
+    print(f"Saved plot to: {plot_path}")
+    plt.show()
+    
+    # Calculate and save key statistics
     optimal_idx = np.argmax(frontier_results['sharpe_ratios'])
     optimal_weights = frontier_results['weights'][optimal_idx]
     
-    # Calculate risk contribution for optimal portfolio
-    cov = returns.cov().values
-    total_risk = np.sqrt(optimal_weights @ cov @ optimal_weights)
-    marginal_risk = (cov @ optimal_weights) / total_risk
-    risk_contrib = optimal_weights * marginal_risk
+    # Save optimal portfolio characteristics
+    optimal_stats = {
+        'Expected Return': frontier_results['returns'][optimal_idx],
+        'Risk': frontier_results['risks'][optimal_idx],
+        'Sharpe Ratio': frontier_results['sharpe_ratios'][optimal_idx],
+        'Tracking Error': frontier_results['tracking_errors'][optimal_idx]
+    }
     
-    # Group by asset class
-    class_risk = {}
+    # Print and save optimal portfolio characteristics
+    print("\nOptimal Portfolio Characteristics:")
+    optimal_stats_df = pd.DataFrame.from_dict(optimal_stats, orient='index', columns=['Value'])
+    optimal_stats_df.to_excel(os.path.join(output_dir, 'optimal_portfolio_stats.xlsx'))
+    print(f"Expected Return: {optimal_stats['Expected Return']:.2%}")
+    print(f"Risk: {optimal_stats['Risk']:.2%}")
+    print(f"Sharpe Ratio: {optimal_stats['Sharpe Ratio']:.2f}")
+    print(f"Tracking Error: {optimal_stats['Tracking Error']:.2%}")
+    
+    # Calculate and save asset class allocations
+    class_alloc = {}
     for i, col in enumerate(returns.columns):
         asset_class = asset_mapping[col]['class']
-        class_risk[asset_class] = class_risk.get(asset_class, 0) + risk_contrib[i]
+        class_alloc[asset_class] = class_alloc.get(asset_class, 0) + optimal_weights[i]
     
-    pd.Series(class_risk).plot(kind='pie', autopct='%1.1f%%', ax=ax3)
-    ax3.set_title('Risk Contribution (Optimal Portfolio)')
+    # Save optimal asset class allocations
+    print("\nOptimal Asset Class Allocation:")
+    class_alloc_df = pd.DataFrame.from_dict(class_alloc, orient='index', columns=['Allocation'])
+    class_alloc_df.to_excel(os.path.join(output_dir, 'optimal_class_allocation.xlsx'))
+    for asset_class, alloc in sorted(class_alloc.items()):
+        print(f"{asset_class:20s}: {alloc:8.2%}")
     
-    # 4. Robust Metrics Analysis
-    ax4 = fig.add_subplot(gs[1, 1])
-    metrics_df = pd.DataFrame({
-        'Return': frontier_results['returns'],
+    # Save detailed allocations evolution
+    allocations_df = pd.DataFrame(
+        allocations,
+        columns=asset_classes,
+        index=[f'Portfolio_{i}' for i in range(len(frontier_results['risks']))]
+    )
+    allocations_df.to_excel(os.path.join(output_dir, 'allocation_evolution.xlsx'))
+    
+    # Save frontier points with tracking errors
+    frontier_df = pd.DataFrame({
         'Risk': frontier_results['risks'],
-        'Robust Sharpe': frontier_results['sharpe_ratios'],
+        'Return': frontier_results['returns'],
+        'Sharpe_Ratio': frontier_results['sharpe_ratios'],
+        'Tracking_Error': frontier_results['tracking_errors']
     })
+    frontier_df.to_excel(os.path.join(output_dir, 'frontier_points.xlsx'))
     
-    ax4.plot(metrics_df.index, metrics_df['Robust Sharpe'], 'b-', label='Robust Sharpe')
-    ax4_twin = ax4.twinx()
-    ax4_twin.plot(metrics_df.index, metrics_df['Return'], 'r--', label='Return')
-    ax4_twin.plot(metrics_df.index, metrics_df['Risk'], 'g--', label='Risk')
-    
-    ax4.set_xlabel('Portfolio Number')
-    ax4.set_ylabel('Robust Sharpe Ratio')
-    ax4_twin.set_ylabel('Return/Risk')
-    ax4.set_title('Portfolio Metrics Evolution')
-    
-    lines1, labels1 = ax4.get_legend_handles_labels()
-    lines2, labels2 = ax4_twin.get_legend_handles_labels()
-    ax4.legend(lines1 + lines2, labels1 + labels2, loc='upper left')
-    
-    # 5. Optimal Portfolio Analysis
-    ax5 = fig.add_subplot(gs[2, 0])
-    optimal_alloc = {}
-    for i, col in enumerate(returns.columns):
-        asset_class = asset_mapping[col]['class']
-        optimal_alloc[asset_class] = optimal_alloc.get(asset_class, 0) + optimal_weights[i]
-    
-    pd.Series(optimal_alloc).plot(kind='bar', ax=ax5)
-    ax5.set_title('Optimal Portfolio Allocation')
-    ax5.set_ylabel('Allocation')
-    plt.xticks(rotation=45)
-    
-    # 6. Efficiency Analysis
-    ax6 = fig.add_subplot(gs[2, 1])
-    efficiency = frontier_results['returns'] / frontier_results['risks']
-    ax6.plot(frontier_results['risks'], efficiency, 'b-')
-    ax6.scatter(frontier_results['risks'], efficiency, c=frontier_results['sharpe_ratios'],
-                cmap='viridis', s=100)
-    ax6.set_xlabel('Risk (Volatility)')
-    ax6.set_ylabel('Return/Risk Ratio')
-    ax6.set_title('Portfolio Efficiency Analysis')
-    ax6.grid(True, alpha=0.3)
-    
-    plt.tight_layout()
-    plt.show()
-    
-    # Print detailed analysis continued
-    def print_detailed_analysis(frontier_results: Dict[str, np.ndarray],
-                              returns: pd.DataFrame,
-                              asset_mapping: Dict):
-        """Print comprehensive analysis of frontier results"""
-        print("\nDetailed Portfolio Analysis")
-        print("=" * 80)
-        
-        # Find optimal portfolio
-        optimal_idx = np.argmax(frontier_results['sharpe_ratios'])
-        optimal_weights = frontier_results['weights'][optimal_idx]
-        
-        print("\n1. Optimal Portfolio Characteristics:")
-        print("-" * 40)
-        print(f"Expected Return: {frontier_results['returns'][optimal_idx]:.4%}")
-        print(f"Risk: {frontier_results['risks'][optimal_idx]:.4%}")
-        print(f"Robust Sharpe Ratio: {frontier_results['sharpe_ratios'][optimal_idx]:.4f}")
-        
-        print("\n2. Asset Class Allocation:")
-        print("-" * 40)
-        class_alloc = {}
-        for i, col in enumerate(returns.columns):
-            asset_class = asset_mapping[col]['class']
-            class_alloc[asset_class] = class_alloc.get(asset_class, 0) + optimal_weights[i]
-        
-        for asset_class, alloc in sorted(class_alloc.items()):
-            print(f"{asset_class:20s}: {alloc:8.2%}")
-        
-        print("\n3. Individual Asset Weights:")
-        print("-" * 40)
-        for i, col in enumerate(returns.columns):
-            if optimal_weights[i] > 0.01:  # Show only significant positions
-                print(f"{col:8s} ({asset_mapping[col]['class']:20s}): {optimal_weights[i]:8.2%}")
-        
-        print("\n4. Risk Decomposition:")
-        print("-" * 40)
-        cov = returns.cov().values
-        total_risk = np.sqrt(optimal_weights @ cov @ optimal_weights)
-        marginal_risk = (cov @ optimal_weights) / total_risk
-        risk_contrib = optimal_weights * marginal_risk
-        
-        class_risk = {}
-        for i, col in enumerate(returns.columns):
-            asset_class = asset_mapping[col]['class']
-            class_risk[asset_class] = class_risk.get(asset_class, 0) + risk_contrib[i]
-        
-        for asset_class, risk in sorted(class_risk.items()):
-            print(f"{asset_class:20s}: {risk:8.2%}")
-        
-        print("\n5. Frontier Characteristics:")
-        print("-" * 40)
-        print(f"Number of portfolios: {len(frontier_results['risks'])}")
-        print(f"Risk range: {frontier_results['risks'].min():.4%} to {frontier_results['risks'].max():.4%}")
-        print(f"Return range: {frontier_results['returns'].min():.4%} to {frontier_results['returns'].max():.4%}")
-        
-        # Calculate concentration metrics
-        herfindahl = np.sum(optimal_weights ** 2)
-        effective_n = 1 / herfindahl
-        
-        print("\n6. Portfolio Concentration Metrics:")
-        print("-" * 40)
-        print(f"Herfindahl Index: {herfindahl:.4f}")
-        print(f"Effective N: {effective_n:.2f}")
-        
-        return {
-            'optimal_weights': optimal_weights,
-            'class_allocation': class_alloc,
-            'risk_contribution': class_risk,
-            'concentration': {
-                'herfindahl': herfindahl,
-                'effective_n': effective_n
-            }
-        }
-    
-    # Run the detailed analysis
-    analysis_results = print_detailed_analysis(frontier_results, returns, asset_mapping)
-    
-    return analysis_results
-
-def plot_risk_contribution_analysis(analysis_results: Dict,
-                                  returns: pd.DataFrame,
-                                  asset_mapping: Dict):
-    """Create detailed risk contribution analysis plots"""
-    
-    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
-    
-    # 1. Risk Contribution vs Allocation
-    risk_contrib = pd.Series(analysis_results['risk_contribution'])
-    allocation = pd.Series(analysis_results['class_allocation'])
-    
-    x = allocation.values
-    y = risk_contrib.values
-    ax1.scatter(x, y)
-    ax1.plot([0, max(x)], [0, max(x)], 'r--', alpha=0.5)  # diagonal line
-    
-    for i, txt in enumerate(risk_contrib.index):
-        ax1.annotate(txt, (x[i], y[i]))
-    
-    ax1.set_xlabel('Allocation')
-    ax1.set_ylabel('Risk Contribution')
-    ax1.set_title('Risk Contribution vs Allocation')
-    ax1.grid(True, alpha=0.3)
-    
-    # 2. Correlation Structure (Fixed version)
-    # Create asset class returns by first grouping columns by asset class
-    asset_class_returns = pd.DataFrame()
-    for asset_class in set(asset_info['class'] for asset_info in asset_mapping.values()):
-        class_columns = [col for col in returns.columns 
-                        if asset_mapping[col]['class'] == asset_class]
-        asset_class_returns[asset_class] = returns[class_columns].mean(axis=1)
-    
-    # Calculate correlation matrix for asset classes
-    corr = asset_class_returns.corr()
-    sns.heatmap(corr, ax=ax2, cmap='RdYlBu_r', center=0, annot=True, fmt='.2f')
-    ax2.set_title('Asset Class Correlation Structure')
-    
-    # 3. Risk Decomposition
-    pd.Series(analysis_results['risk_contribution']).plot(
-        kind='pie',
-        autopct='%1.1f%%',
-        ax=ax3
+    # Save individual asset weights
+    weights_df = pd.DataFrame(
+        frontier_results['weights'],
+        columns=returns.columns,
+        index=[f'Portfolio_{i}' for i in range(len(frontier_results['risks']))]
     )
-    ax3.set_title('Risk Contribution Breakdown')
+    weights_df.to_excel(os.path.join(output_dir, 'portfolio_weights.xlsx'))
     
-    # 4. Diversification Metrics
-    metrics = pd.Series({
-        'Herfindahl': analysis_results['concentration']['herfindahl'],
-        'Effective N': analysis_results['concentration']['effective_n'],
-        'Num Classes': len(analysis_results['class_allocation'])
-    })
+    print(f"\nAll results saved in: {os.path.abspath(output_dir)}")
     
-    metrics.plot(kind='bar', ax=ax4)
-    ax4.set_title('Diversification Metrics')
-    ax4.grid(True, alpha=0.3)
+    # Save summary statistics for the efficient frontier
+    summary_stats = pd.DataFrame({
+        'Metric': ['Minimum', 'Maximum', 'Average'],
+        'Return': [
+            f"{frontier_results['returns'].min():.2%}",
+            f"{frontier_results['returns'].max():.2%}",
+            f"{frontier_results['returns'].mean():.2%}"
+        ],
+        'Risk': [
+            f"{frontier_results['risks'].min():.2%}",
+            f"{frontier_results['risks'].max():.2%}",
+            f"{frontier_results['risks'].mean():.2%}"
+        ],
+        'Sharpe Ratio': [
+            f"{frontier_results['sharpe_ratios'].min():.2f}",
+            f"{frontier_results['sharpe_ratios'].max():.2f}",
+            f"{frontier_results['sharpe_ratios'].mean():.2f}"
+        ],
+        'Tracking Error': [
+            f"{frontier_results['tracking_errors'].min():.2%}",
+            f"{frontier_results['tracking_errors'].max():.2%}",
+            f"{frontier_results['tracking_errors'].mean():.2%}"
+        ]
+    }).set_index('Metric')
     
-    plt.tight_layout()
-    plt.show()
-
-def calculate_frontier_risk_contributions(frontier_results: Dict[str, np.ndarray]) -> pd.DataFrame:
-    """Calculate and analyze risk contributions across the frontier"""
-    n_points, n_assets = frontier_results['weights'].shape
-    contributions = frontier_results['risk_contributions']
+    summary_stats.to_excel(os.path.join(output_dir, 'frontier_summary_stats.xlsx'))
     
-    return pd.DataFrame(
-        contributions,
-        columns=[f'Asset_{i}' for i in range(n_assets)],
-        index=[f'Point_{i}' for i in range(n_points)]
-    )
-
+    return {
+        'optimal_weights': optimal_weights,
+        'class_allocation': class_alloc,
+        'allocations_evolution': allocations_df,
+        'frontier_points': frontier_df,
+        'portfolio_weights': weights_df,
+        'summary_stats': summary_stats
+    }
+    
 def run_complete_analysis():
     """Run complete efficient frontier analysis with visualizations"""
     
@@ -510,10 +427,6 @@ def run_complete_analysis():
         epsilon=0.1
     )
     
-    # Plot risk contribution analysis
-    print("\nGenerating risk analysis visualizations...")
-    plot_risk_contribution_analysis(analysis_results, data['returns'], data['asset_mapping'])
-    
     return {
         'universe_stats': universe_stats,
         'frontier_results': frontier_results,
@@ -521,15 +434,15 @@ def run_complete_analysis():
     }
 
 def run_efficient_frontier_analysis(returns: pd.DataFrame, asset_mapping: Dict):
-    """Run efficient frontier analysis with robust optimization"""
+    """Run efficient frontier analysis with robust optimization, proper scaling, and tracking error constraint"""
     print("\nInitializing Robust Efficient Frontier Analysis...")
     
     # Define asset-specific risk aversion parameters
     alpha_by_class = {
-        'Developed Equities': 1.2,    # Moderate risk aversion
-        'Emerging Markets': 1.8,      # Higher risk aversion
-        'Fixed Income': 0.8,          # Lower risk aversion
-        'Alternative': 1.5            # Higher risk aversion
+        'Developed Equities': 1.2,    
+        'Emerging Markets': 1.8,      
+        'Fixed Income': 0.8,          
+        'Alternative': 1.5            
     }
     
     # Create alpha vector
@@ -538,24 +451,22 @@ def run_efficient_frontier_analysis(returns: pd.DataFrame, asset_mapping: Dict):
         for col in returns.columns
     ])
     
-    # Print configuration
-    print("\nRisk Aversion Parameters:")
-    for col in returns.columns:
-        asset_class = asset_mapping[col]['class']
-        print(f"{col} ({asset_class}): α={alpha_by_class[asset_class]:.2f}")
+    # Create equal-weighted benchmark
+    n_assets = len(returns.columns)
+    benchmark_weights = np.ones(n_assets) / n_assets
     
     try:
-        # Initialize calculator
+        # Initialize calculator with adjusted parameters
         calculator = RobustEfficientFrontier(
             returns=returns,
-            epsilon=0.1,              # Uncertainty parameter
-            alpha=alphas,             # Asset-specific risk aversion
-            half_life=24,             # 2-year half-life for exponential weighting
-            risk_free_rate=0.02,      # 2% risk-free rate
-            transaction_cost=0.002     # 20bps transaction cost
+            epsilon=0.1,              
+            alpha=alphas,             
+            half_life=36,             
+            risk_free_rate=0.02/12,   # Convert annual rate to monthly
+            transaction_cost=0.002     
         )
         
-        # Define constraints
+        # Define constraints with tracking error
         constraints = OptimizationConstraints(
             long_only=True,
             box_constraints={
@@ -565,39 +476,72 @@ def run_efficient_frontier_analysis(returns: pd.DataFrame, asset_mapping: Dict):
                 'Developed Equities': GroupConstraint(
                     assets=[i for i, col in enumerate(returns.columns)
                            if asset_mapping[col]['class'] == 'Developed Equities'],
-                    bounds=(0.2, 0.5)  # 20-50% in developed markets
+                    bounds=(0.01, 0.5)  # 1-50% in developed markets
                 ),
                 'Fixed Income': GroupConstraint(
                     assets=[i for i, col in enumerate(returns.columns)
                            if asset_mapping[col]['class'] == 'Fixed Income'],
-                    bounds=(0.15, 0.4)  # 15-40% in fixed income
+                    bounds=(0.01, 0.4)  # 1-40% in fixed income
                 ),
                 'Emerging Markets': GroupConstraint(
                     assets=[i for i, col in enumerate(returns.columns)
                            if asset_mapping[col]['class'] == 'Emerging Markets'],
-                    bounds=(0.05, 0.25)  # 5-25% in emerging markets
+                    bounds=(0.01, 0.25)  # 1-25% in emerging markets
                 ),
                 'Alternative': GroupConstraint(
                     assets=[i for i, col in enumerate(returns.columns)
                            if asset_mapping[col]['class'] == 'Alternative'],
-                    bounds=(0.05, 0.2)  # 5-20% in alternatives
+                    bounds=(0.01, 0.2)  # 1-20% in alternatives
                 )
-            }
+            },
+            # Add tracking error constraint
+            max_tracking_error=0.05,  # 5% tracking error
+            benchmark_weights=benchmark_weights
         )
         
         print("\nComputing efficient frontier...")
+        # Calculate benchmark characteristics
+        benchmark_return = returns.mean() @ benchmark_weights
+        benchmark_risk = np.sqrt(benchmark_weights @ returns.cov() @ benchmark_weights)
+        print(f"\nBenchmark Characteristics:")
+        print(f"Return: {benchmark_return*12:.2%}")  # Annualized
+        print(f"Risk: {benchmark_risk*np.sqrt(12):.2%}")  # Annualized
+        
+        # Compute frontier with tracking error constraint
         results = calculator.compute_efficient_frontier(
-            n_points=10,              # Number of points on frontier
-            epsilon_range=(0.05, 0.15),  # Range for uncertainty parameter
-            alpha_scale_range=(0.8, 1.2),  # Range for scaling risk aversion
+            n_points=20,             
+            epsilon_range=(0.05, 0.5),
+            alpha_scale_range=(0.8, 1.2),
             constraints=constraints
         )
         
-        # Print initial results
+        # Annualize returns and risks for Sharpe ratio calculation
+        results['returns'] = results['returns'] * 12  # Annualize returns
+        results['risks'] = results['risks'] * np.sqrt(12)  # Annualize risks
+        
+        # Recalculate Sharpe ratios with annualized values
+        rf_rate = calculator.risk_free_rate * 12  # Annualize risk-free rate
+        results['sharpe_ratios'] = (results['returns'] - rf_rate) / results['risks']
+        
+        # Calculate tracking errors for each portfolio
+        tracking_errors = []
+        cov_matrix = returns.cov().values
+        for weights in results['weights']:
+            tracking_error = np.sqrt(
+                (weights - benchmark_weights).T @ 
+                cov_matrix @ 
+                (weights - benchmark_weights)
+            ) * np.sqrt(12)  # Annualize
+            tracking_errors.append(tracking_error)
+        
+        results['tracking_errors'] = np.array(tracking_errors)
+        
         print("\nFrontier Computation Complete:")
         print(f"Number of portfolios: {len(results['risks'])}")
         print(f"Risk range: {results['risks'].min():.4%} to {results['risks'].max():.4%}")
         print(f"Return range: {results['returns'].min():.4%} to {results['returns'].max():.4%}")
+        print(f"Sharpe ratio range: {results['sharpe_ratios'].min():.2f} to {results['sharpe_ratios'].max():.2f}")
+        print(f"Tracking error range: {min(tracking_errors):.2%} to {max(tracking_errors):.2%}")
         
         return results
         
