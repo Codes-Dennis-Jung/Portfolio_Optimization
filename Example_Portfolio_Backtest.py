@@ -1,5 +1,7 @@
 import pandas as pd
 import seaborn as sns
+import os
+import matplotlib as plt
 from PortOpt import *
 
 ################################################################################################################
@@ -243,7 +245,7 @@ def test_multi_asset_backtest():
     print("\nStep 4: Initializing backtester...")
     backtester = RobustBacktestOptimizer(
         returns=returns,
-        lookback_window=24,           # 2 years
+        lookback_window=36,           # 2 years
         rebalance_frequency=3,        # Quarterly
         epsilon=0.1,                  # Uncertainty parameter
         transaction_cost=0.001,       # 10bps per trade
@@ -256,14 +258,17 @@ def test_multi_asset_backtest():
     # Define portfolio constraints
     constraints = OptimizationConstraints(
         long_only=True,
-        box_constraints={i: (0.0, 0.3) for i in range(len(returns.columns))},  # Max 30% per asset
+        box_constraints={i: (0.0, 0.5) for i in range(len(returns.columns))},  # Max 30% per asset
         group_constraints=group_constraints,
         max_turnover=0.5  # 50% max turnover per rebalance
     )
     
     # Define strategies to test (start with just minimum variance)
     strategies = [
-        (ObjectiveFunction.MINIMUM_VARIANCE, "Minimum Variance", {})
+        (ObjectiveFunction.MINIMUM_VARIANCE, "Minimum Variance", {}),
+        (ObjectiveFunction.GARLAPPI_ROBUST, "Garlappi Robust", {}),
+        (ObjectiveFunction.MEAN_VARIANCE, "Mean Variance", {}),
+        (ObjectiveFunction.MAXIMUM_DIVERSIFICATION, "Max Diversifiction Variance", {})
     ]
     
     print("\nStep 5: Running backtests...")
@@ -286,6 +291,9 @@ def test_multi_asset_backtest():
                 current_weights=initial_weights,
                 **params
             )
+            
+            #filename_ = os.getcwd() + str(name)
+            #backtester.save_backtest_results(strategy_result,filename_)
             
             # Print strategy summary
             metrics = strategy_result['backtest_metrics']
