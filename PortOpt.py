@@ -5,7 +5,6 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from dataclasses import dataclass
 import cvxpy as cp
-import scipy.stats
 from scipy import stats
 from typing import Dict, List, Optional, Tuple, Union, Callable
 from enum import Enum
@@ -941,7 +940,8 @@ class RobustPortfolioOptimizer(PortfolioOptimizer):
         half_life: int = 36,
         risk_free_rate: float = 0.0,
         transaction_cost: float = 0.001
-    ):
+    ):    
+        
         # Store original returns and parameters
         self.original_returns = returns.copy()
         self.epsilon = epsilon
