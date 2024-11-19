@@ -8,21 +8,13 @@ import matplotlib.pyplot as plt
 from tqdm import tqdm
 from dataclasses import dataclass
 import cvxpy as cp
-from scipy import stats
 from typing import Dict, List, Optional, Tuple, Union, Callable
 from enum import Enum
 
 @dataclass
 class GroupConstraint:
-    """
-    Class for defining group-level constraints in portfolio optimization
-    
-    Attributes:
-        assets: List of asset indices that belong to the group
-        bounds: Tuple of (min_weight, max_weight) for group's total allocation
-    """
-    assets: List[int]  # List of asset indices in the group
-    bounds: Tuple[float, float]  # (min_weight, max_weight) for group allocation
+    assets: List[int]  
+    bounds: Tuple[float, float]
 
     def __post_init__(self):
         """Validate the constraint parameters"""
@@ -43,9 +35,6 @@ class GroupConstraint:
 
 @dataclass
 class OptimizationConstraints:
-    """
-    Class for defining portfolio optimization constraints
-    """
     group_constraints: Optional[Dict[str, GroupConstraint]] = None
     box_constraints: Optional[Dict[int, Tuple[float, float]]] = None
     long_only: bool = True
@@ -232,8 +221,6 @@ class PortfolioDataHandler:
         return metrics
 
 class PortfolioObjective:
-    """Portfolio objective function factory"""
-    
     @staticmethod
     def __calculate_estimation_error_covariance(returns: np.ndarray, method: str = 'asymptotic') -> np.ndarray:
         """
@@ -645,7 +632,7 @@ class PortfolioOptimizer:
         
         # Initialize portfolio objective functions
         self.objective_functions = PortfolioObjective()
-        
+
     def optimize(
         self,
         objective: ObjectiveFunction,
@@ -654,22 +641,174 @@ class PortfolioOptimizer:
         **kwargs
     ) -> Dict[str, Union[np.ndarray, float]]:
         """
-        Optimize portfolio based on selected objective and constraints
+        Optimize portfolio based on selected objective and constraints.
+        If optimization fails, tries different approaches in the following order:
+        1. Original method with original constraints
+        2. Alternative method with original constraints
+        3. Original method with relaxed constraints
+        4. Alternative method with relaxed constraints
+        5. Either method with minimal constraints
         
         Args:
             objective: Selected objective function
             constraints: Optimization constraints
             current_weights: Current portfolio weights
             **kwargs: Additional parameters for specific objective functions
+            
+        Returns:
+            Dictionary containing optimization results
+            
+        Raises:
+            ValueError: If all optimization attempts fail
         """
         if current_weights is None:
             current_weights = np.ones(len(self.returns.columns)) / len(self.returns.columns)
             
-        if self.optimization_method == OptimizationMethod.SCIPY:
-            return self._optimize_scipy(objective, constraints, current_weights, **kwargs)
-        else:
-            return self._optimize_cvxpy(objective, constraints, current_weights, **kwargs)
+        original_method = self.optimization_method
+        
+        try:
+            # Step 1: Try original method with original constraints
+            try:
+                if original_method == OptimizationMethod.SCIPY:
+                    return self._optimize_scipy(objective, constraints, current_weights, **kwargs)
+                else:
+                    return self._optimize_cvxpy(objective, constraints, current_weights, **kwargs)
+            except ValueError as e1:
+                print(f"First attempt with {original_method.value} failed: {str(e1)}")
+                
+                # Step 2: Try alternative method with original constraints
+                try:
+                    self.optimization_method = (OptimizationMethod.CVXPY 
+                                            if original_method == OptimizationMethod.SCIPY 
+                                            else OptimizationMethod.SCIPY)
+                    print(f"Attempting optimization with {self.optimization_method.value}...")
+                    
+                    if self.optimization_method == OptimizationMethod.SCIPY:
+                        return self._optimize_scipy(objective, constraints, current_weights, **kwargs)
+                    else:
+                        return self._optimize_cvxpy(objective, constraints, current_weights, **kwargs)
+                except ValueError as e2:
+                    print(f"Second attempt with alternative method failed: {str(e2)}")
+                    
+                    # Step 3: Try with relaxed constraints
+                    relaxed_constraints = OptimizationConstraints(
+                        group_constraints=constraints.group_constraints,
+                        box_constraints=constraints.box_constraints,
+                        long_only=constraints.long_only,
+                        max_turnover=constraints.max_turnover,
+                        target_risk=None,  # Remove target risk constraint
+                        target_return=None,  # Remove target return constraint
+                        max_tracking_error=None,
+                        benchmark_weights=constraints.benchmark_weights
+                    )
+                    
+                    print("Attempting optimization with relaxed constraints...")
+                    
+                    try:
+                        # Try original method with relaxed constraints
+                        self.optimization_method = original_method
+                        if original_method == OptimizationMethod.SCIPY:
+                            return self._optimize_scipy(objective, relaxed_constraints, current_weights, **kwargs)
+                        else:
+                            return self._optimize_cvxpy(objective, relaxed_constraints, current_weights, **kwargs)
+                    except ValueError as e3:
+                        print(f"Third attempt with relaxed constraints failed: {str(e3)}")
+                        
+                        try:
+                            # Try alternative method with relaxed constraints
+                            self.optimization_method = (OptimizationMethod.CVXPY 
+                                                    if original_method == OptimizationMethod.SCIPY 
+                                                    else OptimizationMethod.SCIPY)
+                            print(f"Attempting relaxed optimization with {self.optimization_method.value}...")
+                            
+                            if self.optimization_method == OptimizationMethod.SCIPY:
+                                return self._optimize_scipy(objective, relaxed_constraints, current_weights, **kwargs)
+                            else:
+                                return self._optimize_cvxpy(objective, relaxed_constraints, current_weights, **kwargs)
+                        except ValueError as e4:
+                            print(f"Fourth attempt with alternative method and relaxed constraints failed: {str(e4)}")
+                            
+                            # Final attempt: Try with minimal constraints
+                            minimal_constraints = OptimizationConstraints(
+                                long_only=True,
+                                box_constraints={i: (0.0, 1.0) for i in range(len(self.returns.columns))}
+                            )
+                            
+                            print("Final attempt with minimal constraints...")
+                            
+                            try:
+                                # Try both methods with minimal constraints
+                                for method in [OptimizationMethod.SCIPY, OptimizationMethod.CVXPY]:
+                                    try:
+                                        self.optimization_method = method
+                                        if method == OptimizationMethod.SCIPY:
+                                            return self._optimize_scipy(objective, minimal_constraints, current_weights, **kwargs)
+                                        else:
+                                            return self._optimize_cvxpy(objective, minimal_constraints, current_weights, **kwargs)
+                                    except ValueError:
+                                        continue
+                            except Exception as e5:
+                                # If all attempts fail, raise comprehensive error
+                                raise ValueError(
+                                    f"All optimization attempts failed:\n"
+                                    f"1. Original method ({original_method.value}): {str(e1)}\n"
+                                    f"2. Alternative method: {str(e2)}\n"
+                                    f"3. Relaxed constraints: {str(e3)}\n"
+                                    f"4. Alternative method with relaxed constraints: {str(e4)}\n"
+                                    f"5. Minimal constraints: {str(e5)}"
+                                )
+        
+        finally:
+            # Restore original optimization method
+            self.optimization_method = original_method
             
+    def _try_relaxed_optimization(
+        self,
+        objective: ObjectiveFunction,
+        constraints: OptimizationConstraints,
+        current_weights: np.ndarray,
+        **kwargs
+    ) -> Dict[str, Union[np.ndarray, float]]:
+        """
+        Attempt optimization with gradually relaxed constraints
+        
+        Args:
+            objective: Selected objective function
+            constraints: Original optimization constraints
+            current_weights: Current portfolio weights
+            **kwargs: Additional optimization parameters
+        """
+        # Try with relaxed target risk/return constraints
+        relaxed_constraints = OptimizationConstraints(
+            group_constraints=constraints.group_constraints,
+            box_constraints=constraints.box_constraints,
+            long_only=constraints.long_only,
+            max_turnover=constraints.max_turnover,
+            target_risk=None,  # Remove target risk constraint
+            target_return=None,  # Remove target return constraint
+            max_tracking_error=None if constraints.max_tracking_error else None,
+            benchmark_weights=constraints.benchmark_weights
+        )
+        
+        try:
+            if self.optimization_method == OptimizationMethod.SCIPY:
+                return self._optimize_scipy(objective, relaxed_constraints, current_weights, **kwargs)
+            else:
+                return self._optimize_cvxpy(objective, relaxed_constraints, current_weights, **kwargs)
+        except ValueError as e:
+            print(f"Optimization with relaxed constraints failed: {str(e)}")
+            
+            # Try with minimal constraints
+            minimal_constraints = OptimizationConstraints(
+                long_only=True,
+                box_constraints={i: (0.0, 1.0) for i in range(len(self.returns.columns))}
+            )
+            
+            if self.optimization_method == OptimizationMethod.SCIPY:
+                return self._optimize_scipy(objective, minimal_constraints, current_weights, **kwargs)
+            else:
+                return self._optimize_cvxpy(objective, minimal_constraints, current_weights, **kwargs)
+                        
     def _compute_ewm_covariance(self, half_life: int) -> np.ndarray:
         """Compute exponentially weighted covariance matrix"""
         lambda_param = np.log(2) / half_life
@@ -1647,7 +1786,6 @@ class RobustBacktestOptimizer(RobustPortfolioOptimizer):
         transaction_cost: float = 0.001,
         benchmark_returns: Optional[pd.DataFrame] = None,
         risk_free_rate: float = 0.0,
-        epsilon_scaling: Optional[Dict[int, Callable]] = None,
         min_history: int = 24,
         out_of_sample: bool = False,
         **kwargs
@@ -1696,7 +1834,19 @@ class RobustBacktestOptimizer(RobustPortfolioOptimizer):
         initial_weights: Optional[np.ndarray] = None,
         **kwargs
     ) -> Dict[str, Union[pd.Series, pd.DataFrame]]:
-        """Run backtest with processed data and proper validation"""
+        """
+        Run backtest with proper handling of rolling windows where expected returns,
+        epsilon, and alpha use the last point of each window while returns use the full window.
+        
+        Args:
+            objective: Selected objective function
+            constraints: Optimization constraints
+            initial_weights: Optional starting portfolio weights
+            **kwargs: Additional parameters for optimization
+            
+        Returns:
+            Dictionary containing backtest results including returns, weights, and metrics
+        """
         # Create data handler for each backtest window
         data_handler = PortfolioDataHandler(min_history=self.lookback_window)
         
@@ -1732,25 +1882,43 @@ class RobustBacktestOptimizer(RobustPortfolioOptimizer):
         try:
             for t in tqdm(range(self.lookback_window, len(dates))):
                 current_date = dates[t]
+                window_start = t - self.lookback_window
+                window_end = t
                 
                 if (t - self.lookback_window) % self.rebalance_frequency == 0:
                     try:
-                        # Get and process historical data window
-                        historical_returns = returns.iloc[t-self.lookback_window:t]
-                        window_data = data_handler.process_data(historical_returns)
-                        self.epsilon                       
+                        # Get historical returns for full window
+                        historical_returns = returns.iloc[window_start:window_end]
                         
-                        ###################################
+                        # Create window data with full returns history but single point for other data
+                        window_data = {
+                            'returns': historical_returns
+                        }
                         
-                    ####
-                        # Record epsilon values
-                        epsilon_history.loc[current_date] = self.epsilon.loc[current_date]
-                        print(epsilon_history.loc[current_date])
+                        # Use only the last point for expected returns if available
+                        if hasattr(self, 'expected_returns') and self.expected_returns is not None:
+                            window_data['expected_returns'] = pd.DataFrame(
+                                self.expected_returns.loc[current_date]).T
                         
-                        # Create optimizer with processed data
+                        # Use only the last point for epsilon
+                        if self.epsilon is not None:
+                            current_epsilon = self.epsilon.loc[current_date]
+                            epsilon_history.loc[current_date] = current_epsilon
+                            window_data['epsilon'] = pd.DataFrame(current_epsilon).T
+                        
+                        # Use only the last point for alpha
+                        if hasattr(self, 'alpha') and self.alpha is not None:
+                            window_data['alpha'] = pd.DataFrame(self.alpha.loc[current_date]).T
+                        
+                        # Process the window data
+                        processed_window = data_handler.process_data(**window_data)
+                        
+                        # Create temporary optimizer with processed data
                         temp_optimizer = RobustPortfolioOptimizer(
-                            returns=window_data['returns'],
-                            epsilon=self.epsilon.loc[current_date],
+                            returns=processed_window['returns'],
+                            expected_returns=processed_window.get('expected_returns'),
+                            epsilon=processed_window.get('epsilon'),
+                            alpha=processed_window.get('alpha'),
                             risk_free_rate=self.risk_free_rate,
                             transaction_cost=self.transaction_cost
                         )
@@ -1771,14 +1939,17 @@ class RobustBacktestOptimizer(RobustPortfolioOptimizer):
                             'sharpe_ratio': result['sharpe_ratio']
                         }
                         
+                        # Calculate and record transaction costs
                         costs = self.transaction_cost * np.sum(np.abs(new_weights - current_weights))
                         realized_costs.loc[current_date] = costs
                         current_weights = new_weights
                         
                     except Exception as e:
                         print(f"Optimization failed at {current_date}: {str(e)}")
+                        # Keep previous weights on failure
+                        print("Maintaining previous weights due to optimization failure")
                         
-                # Record weights and returns
+                # Record weights and calculate returns
                 portfolio_weights.loc[current_date] = current_weights
                 period_return = returns.loc[current_date]
                 portfolio_returns.loc[current_date] = (
@@ -1798,7 +1969,7 @@ class RobustBacktestOptimizer(RobustPortfolioOptimizer):
             'epsilon_history': epsilon_history
         }
         
-        # Calculate final metrics with processed data
+        # Calculate final metrics
         results['backtest_metrics'] = self._calculate_backtest_metrics(
             portfolio_returns,
             portfolio_weights,

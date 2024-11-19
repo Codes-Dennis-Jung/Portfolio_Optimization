@@ -527,24 +527,39 @@ def run_complete_analysis():
         'frontier_results': frontier_results,
         'analysis_results': analysis_results
     }
-
 def run_efficient_frontier_analysis(returns: pd.DataFrame, asset_mapping: Dict):
-    """Run efficient frontier analysis with robust optimization, proper scaling, and tracking error constraint"""
+    """
+    Run efficient frontier analysis with robust optimization, proper scaling, and tracking error constraint
+    """
     print("\nInitializing Robust Efficient Frontier Analysis...")
     
-    # Define asset-specific risk aversion parameters
+    # Define asset-specific risk aversion and uncertainty parameters based on asset class
     alpha_by_class = {
-        'Developed Equities': 1.2,    
-        'Emerging Markets': 1.8,      
-        'Fixed Income': 0.8,          
-        'Alternative': 1.5            
+        'Developed Equities': 1.2,    # Lower risk aversion for developed markets
+        'Emerging Markets': 1.8,      # Higher risk aversion for emerging markets
+        'Fixed Income': 0.8,          # Lowest risk aversion for fixed income
+        'Alternative': 1.5            # Moderate-high risk aversion for alternatives
     }
     
-    # Create alpha vector
-    alphas = np.array([
-        alpha_by_class[asset_mapping[col]['class']] 
-        for col in returns.columns
-    ])
+    epsilon_by_class = {
+        'Developed Equities': 0.08,   # Lower uncertainty for developed markets
+        'Emerging Markets': 0.15,     # Higher uncertainty for emerging markets
+        'Fixed Income': 0.05,         # Lowest uncertainty for fixed income
+        'Alternative': 0.12           # Moderate-high uncertainty for alternatives
+    }
+    
+    # Create date-aligned DataFrames for alpha and epsilon
+    alphas = pd.DataFrame(
+        {col: alpha_by_class[asset_mapping[col]['class']] 
+         for col in returns.columns},
+        index=returns.index
+    )
+    
+    epsilons = pd.DataFrame(
+        {col: epsilon_by_class[asset_mapping[col]['class']] 
+         for col in returns.columns},
+        index=returns.index
+    )
     
     # Create equal-weighted benchmark
     n_assets = len(returns.columns)
@@ -553,45 +568,46 @@ def run_efficient_frontier_analysis(returns: pd.DataFrame, asset_mapping: Dict):
     try:
         # Initialize calculator with adjusted parameters
         calculator = RobustEfficientFrontier(
-            optimization_method=OptimizationMethod.CVXPY,
             returns=returns,
-            epsilon=0.1,              
-            alpha=alphas,             
-            half_life=36,             
-            risk_free_rate=0.02/12,   # Convert annual rate to monthly
-            transaction_cost=0.002     
+            expected_returns=None,  # Will use historical means
+            epsilon=epsilons,       # Asset-specific uncertainty
+            alpha=alphas,           # Asset-specific risk aversion
+            omega_method='bayes',   # Use Bayesian estimation for uncertainty
+            optimization_method=OptimizationMethod.CVXPY,  # Use CVXPY for better handling of constraints
+            half_life=36,          # 3-year half-life for exponential weighting
+            risk_free_rate=0.02/12,  # Convert annual rate to monthly
+            transaction_cost=0.002    # 20 bps transaction cost
         )
         
-        # Define constraints with tracking error
+        # Define comprehensive constraints
         constraints = OptimizationConstraints(
             long_only=True,
             box_constraints={
-                i: (0.0, 0.50) for i in range(len(returns.columns))  # Max 25% per asset
+                i: (0.0, 0.25) for i in range(len(returns.columns))  # Max 25% per asset
             },
             group_constraints={
                 'Developed Equities': GroupConstraint(
                     assets=[i for i, col in enumerate(returns.columns)
                            if asset_mapping[col]['class'] == 'Developed Equities'],
-                    bounds=(0., 0.5)  # 1-50% in developed markets
+                    bounds=(0.2, 0.6)  # 20-60% in developed markets
                 ),
                 'Fixed Income': GroupConstraint(
                     assets=[i for i, col in enumerate(returns.columns)
                            if asset_mapping[col]['class'] == 'Fixed Income'],
-                    bounds=(0., 0.4)  # 1-40% in fixed income
+                    bounds=(0.2, 0.5)  # 20-50% in fixed income
                 ),
                 'Emerging Markets': GroupConstraint(
                     assets=[i for i, col in enumerate(returns.columns)
                            if asset_mapping[col]['class'] == 'Emerging Markets'],
-                    bounds=(0., 0.5)  # 1-25% in emerging markets
+                    bounds=(0.05, 0.25)  # 5-25% in emerging markets
                 ),
                 'Alternative': GroupConstraint(
                     assets=[i for i, col in enumerate(returns.columns)
                            if asset_mapping[col]['class'] == 'Alternative'],
-                    bounds=(0., 0.4)  # 1-20% in alternatives
+                    bounds=(0.05, 0.20)  # 5-20% in alternatives
                 )
             },
-            # Add tracking error constraint
-            max_tracking_error=0.05,  # 5% tracking error
+            max_tracking_error=0.05,  # 5% annual tracking error limit
             benchmark_weights=benchmark_weights
         )
         
@@ -603,15 +619,20 @@ def run_efficient_frontier_analysis(returns: pd.DataFrame, asset_mapping: Dict):
         print(f"Return: {benchmark_return*12:.2%}")  # Annualized
         print(f"Risk: {benchmark_risk*np.sqrt(12):.2%}")  # Annualized
         
-        # Compute frontier with tracking error constraint
+        # Compute frontier with advanced parameters
         results = calculator.compute_efficient_frontier(
-            n_points=15,             
-            epsilon_range=(0.05, 0.1),
-            alpha_scale_range=(0.8, 1.2),
+            n_points=20,             # More points for smoother frontier
+            epsilon_range={          # Asset-class specific uncertainty ranges
+                'Developed Equities': (0.05, 0.15),
+                'Emerging Markets': (0.10, 0.25),
+                'Fixed Income': (0.03, 0.10),
+                'Alternative': (0.08, 0.20)
+            },
+            alpha_scale_range=(0.8, 1.5),  # Allow for wider range of risk aversion scaling
             constraints=constraints
         )
         
-        # Annualize returns and risks for Sharpe ratio calculation
+        # Annualize metrics
         results['returns'] = results['returns'] * 12  # Annualize returns
         results['risks'] = results['risks'] * np.sqrt(12)  # Annualize risks
         
@@ -634,16 +655,28 @@ def run_efficient_frontier_analysis(returns: pd.DataFrame, asset_mapping: Dict):
         
         print("\nFrontier Computation Complete:")
         print(f"Number of portfolios: {len(results['risks'])}")
-        print(f"Risk range: {results['risks'].min():.4%} to {results['risks'].max():.4%}")
-        print(f"Return range: {results['returns'].min():.4%} to {results['returns'].max():.4%}")
+        print(f"Risk range: {results['risks'].min():.2%} to {results['risks'].max():.2%}")
+        print(f"Return range: {results['returns'].min():.2%} to {results['returns'].max():.2%}")
         print(f"Sharpe ratio range: {results['sharpe_ratios'].min():.2f} to {results['sharpe_ratios'].max():.2f}")
         print(f"Tracking error range: {min(tracking_errors):.2%} to {max(tracking_errors):.2%}")
+        
+        # Calculate and print risk contributions
+        optimal_idx = np.argmax(results['sharpe_ratios'])
+        optimal_weights = results['weights'][optimal_idx]
+        
+        print("\nOptimal Portfolio Composition by Asset Class:")
+        for asset_class in alpha_by_class.keys():
+            class_weight = sum(
+                optimal_weights[i] for i, col in enumerate(returns.columns)
+                if asset_mapping[col]['class'] == asset_class
+            )
+            print(f"{asset_class:20s}: {class_weight:8.2%}")
         
         return results
         
     except Exception as e:
         print(f"\nError in frontier computation: {str(e)}")
         raise
-
+    
 if __name__ == "__main__":
     results = run_complete_analysis()
