@@ -1,3 +1,6 @@
+"""
+@author: Dennis Jung
+"""
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
@@ -70,12 +73,169 @@ class ObjectiveFunction(Enum):
     RISK_PARITY = "risk_parity"
     EQUAL_RISK_CONTRIBUTION = "equal_risk_contribution"
     HIERARCHICAL_RISK_PARITY = "hierarchical_risk_parity"
+    
+class PortfolioDataHandler:
+    def __init__(self, min_history: int = 24):
+        self.min_history = min_history
+        
+    def process_data(
+        self,
+        returns: pd.DataFrame,
+        benchmark_returns: Optional[pd.DataFrame] = None,
+        expected_returns: Optional[pd.DataFrame] = None,
+        epsilon: Optional[pd.DataFrame] = None,
+        alpha: Optional[pd.DataFrame] = None
+    ) -> Dict[str, pd.DataFrame]:
+        processed_data = {}
+        
+        # Process returns
+        clean_returns = self._clean_returns(returns)
+        if len(clean_returns) < self.min_history:
+            raise ValueError(f"Insufficient data: {len(clean_returns)} periods < {self.min_history} minimum")
+        
+        clean_returns = self._handle_missing_data(clean_returns)
+        clean_returns = self._remove_outliers(clean_returns)
+        processed_data['returns'] = clean_returns
+        
+        # Process benchmark
+        if benchmark_returns is not None:
+            processed_data['benchmark_returns'] = self._process_benchmark(clean_returns, benchmark_returns)
+        
+        # Process expected returns
+        if expected_returns is not None:
+            processed_data['expected_returns'] = self._validate_data_alignment(clean_returns, expected_returns)
+        
+        # Process epsilon
+        if epsilon is not None:
+            processed_data['epsilon'] = self._validate_data_alignment(clean_returns, epsilon)
+        
+        # Process alpha
+        if alpha is not None:
+            processed_data['alpha'] = self._validate_data_alignment(clean_returns, alpha)
+        
+        # Calculate metrics
+        processed_data.update(self._calculate_metrics(clean_returns))
+        
+        return processed_data
+
+    def _validate_data_alignment(
+        self,
+        returns: pd.DataFrame,
+        data: pd.DataFrame,
+    ) -> pd.DataFrame:
+        """Validate and align DataFrame with returns data"""
+        if not isinstance(data, pd.DataFrame):
+            raise ValueError(f"Data must be a DataFrame")
+            
+        missing_cols = set(returns.columns) - set(data.columns)
+        if missing_cols:
+            raise ValueError(f"Missing data for assets: {missing_cols}")
+            
+        return data.reindex(columns=returns.columns)
+        
+    def _clean_returns(self, returns: pd.DataFrame) -> pd.DataFrame:
+        """Clean and validate return data"""
+        # Convert index to datetime
+        if not isinstance(returns.index, pd.DatetimeIndex):
+            returns.index = pd.to_datetime(returns.index)
+            
+        # Sort index
+        returns = returns.sort_index()
+        
+        # Convert to float
+        returns = returns.astype(float)
+        
+        # Remove duplicate indices
+        returns = returns[~returns.index.duplicated(keep='first')]
+        
+        return returns
+        
+    def _handle_missing_data(self, returns: pd.DataFrame) -> pd.DataFrame:
+        """Handle missing values in return data"""
+        # Calculate missing percentage
+        missing_pct = returns.isnull().mean()
+        
+        # Remove assets with too many missing values
+        returns = returns.loc[:, missing_pct < 0.1]
+        
+        # Forward/backward fill remaining missing values
+        returns = returns.fillna(method='ffill').fillna(method='bfill')
+        
+        # Fill any remaining NaN with 0
+        returns = returns.fillna(0)
+        
+        return returns
+        
+    def _remove_outliers(self, returns: pd.DataFrame) -> pd.DataFrame:
+        """Remove statistical outliers from return data"""
+        clean_returns = returns.copy()
+        
+        for column in returns.columns:
+            series = returns[column]
+            # Calculate z-scores
+            z_scores = np.abs((series - series.mean()) / series.std())
+            # Replace outliers with median
+            clean_returns.loc[z_scores > 3, column] = series.median()
+            
+        return clean_returns
+        
+    def _process_benchmark(self, returns: pd.DataFrame, benchmark: pd.Series) -> pd.Series:
+        """Process and align benchmark returns"""
+        # Convert to datetime index if needed
+        if not isinstance(benchmark.index, pd.DatetimeIndex):
+            benchmark.index = pd.to_datetime(benchmark.index)
+            
+        # Align with returns data
+        aligned_benchmark = benchmark.reindex(returns.index)
+        
+        # Handle missing values
+        aligned_benchmark = aligned_benchmark.fillna(method='ffill').fillna(method='bfill')
+        
+        return aligned_benchmark
+        
+    def _validate_expected_returns(
+        self,
+        returns: pd.DataFrame,
+        expected_returns: pd.Series
+    ) -> pd.Series:
+        """Validate and align expected returns"""
+        # Ensure all assets are present
+        missing_assets = set(returns.columns) - set(expected_returns.index)
+        if missing_assets:
+            raise ValueError(f"Missing expected returns for assets: {missing_assets}")
+            
+        # Align with return data
+        aligned_expected = expected_returns.reindex(returns.columns)
+        
+        return aligned_expected
+        
+    def _calculate_metrics(self, returns: pd.DataFrame) -> Dict[str, pd.DataFrame]:
+        """Calculate additional statistical metrics"""
+        metrics = {}
+        
+        # Calculate correlation matrix
+        metrics['correlation'] = returns.corr()
+        
+        # Calculate rolling metrics
+        rolling_window = min(12, len(returns) // 4)
+        metrics['rolling_vol'] = returns.rolling(window=rolling_window).std() * np.sqrt(12)
+        metrics['rolling_corr'] = returns.rolling(window=rolling_window).corr()
+        
+        # Calculate return statistics
+        stats = pd.DataFrame(index=returns.columns)
+        stats['annualized_return'] = (1 + returns.mean()) ** 12 - 1
+        stats['annualized_vol'] = returns.std() * np.sqrt(12)
+        stats['skewness'] = returns.skew()
+        stats['kurtosis'] = returns.kurtosis()
+        metrics['statistics'] = stats
+        
+        return metrics
 
 class PortfolioObjective:
     """Portfolio objective function factory"""
     
     @staticmethod
-    def __calculate_estimation_error_covariance(returns: np.ndarray, method: str = 'bayes') -> np.ndarray:
+    def __calculate_estimation_error_covariance(returns: np.ndarray, method: str = 'asymptotic') -> np.ndarray:
         """
         Calculate the covariance matrix of estimation errors (Omega)
         """
@@ -132,10 +292,19 @@ class PortfolioObjective:
         return omega
     
     @staticmethod
-    def garlappi_robust(returns: np.ndarray, epsilon: float, alpha: np.ndarray,
-                        omega_method: str = 'bayes', omega: Optional[np.ndarray] = None) -> callable:
+    def garlappi_robust(returns: np.ndarray, epsilon: Union[float, np.ndarray], 
+                       alpha: np.ndarray, omega_method: str = 'bayes', 
+                       omega: Optional[np.ndarray] = None) -> callable:
         """
         Implements Garlappi et al. (2007) robust portfolio optimization with fixed inputs
+        and support for asset-specific uncertainty parameters
+        
+        Args:
+            returns: Historical returns matrix
+            epsilon: Uncertainty parameter (scalar or vector for asset-specific uncertainty)
+            alpha: Risk aversion parameters (vector)
+            omega_method: Method for estimating uncertainty covariance
+            omega: Optional pre-computed uncertainty covariance matrix
         """
         # Ensure returns is 2-d numpy array
         if isinstance(returns, pd.DataFrame):
@@ -146,8 +315,9 @@ class PortfolioObjective:
         mu = np.mean(returns, axis=0)
         Sigma = np.cov(returns, rowvar=False)
         
-        # Ensure alpha is proper array
+        # Ensure alpha and epsilon are proper arrays
         alpha = np.asarray(alpha).flatten()
+        epsilon = np.asarray(epsilon).flatten() if isinstance(epsilon, np.ndarray) else np.full_like(alpha, epsilon)
         
         # Calculate Omega if not provided
         if omega is None:
@@ -174,11 +344,11 @@ class PortfolioObjective:
                 if omega_w_norm < 1e-8:
                     return 1e10  # Large penalty instead of infinity
                 
-                # Worst-case mean adjustment
-                scaling = np.sqrt(epsilon * omega_w_norm)
-                worst_case_mean = mu - scaling * omega_w / omega_w_norm
+                # Asset-specific worst-case mean adjustment
+                scaling = np.sqrt(epsilon * omega_w_norm)  # Element-wise multiplication with epsilon vector
+                worst_case_mean = mu - np.multiply(scaling, omega_w) / omega_w_norm
                 
-                # Complete objective
+                # Complete objective with asset-specific uncertainty
                 robust_utility = w @ worst_case_mean - variance_penalty
                 
                 return -float(robust_utility)  # Ensure scalar output
@@ -196,10 +366,21 @@ class PortfolioObjective:
         return objective
         
     @staticmethod
-    def robust_mean_variance(mu: np.ndarray, Sigma: np.ndarray, epsilon: float, kappa: float) -> callable:
+    def robust_mean_variance(mu: np.ndarray, Sigma: np.ndarray, epsilon: Union[float, np.ndarray], kappa: float) -> callable:
+        """Robust mean-variance optimization with vector epsilon support"""
+        if isinstance(epsilon, (int, float)):
+            epsilon = np.full_like(mu, epsilon)
+            
         def objective(w: np.ndarray) -> float:
+            w = np.asarray(w).flatten()
             risk = np.sqrt(w.T @ Sigma @ w)
-            return -mu.T @ w + kappa * risk - epsilon * risk
+            if risk < 1e-8:
+                return 1e10  # Penalty for numerical instability
+                
+            portfolio_return = float(mu.T @ w)
+            risk_penalty = float((kappa - epsilon.T @ w) * risk) 
+            return -(portfolio_return - risk_penalty)  # Minimize negative utility
+            
         return objective
 
     @staticmethod
@@ -442,21 +623,12 @@ class PortfolioOptimizer:
     def __init__(
         self,
         returns: pd.DataFrame,
+        expected_returns: Optional[np.ndarray] = None,
         optimization_method: OptimizationMethod = OptimizationMethod.SCIPY,
         half_life: int = 36,
         risk_free_rate: float = 0.0,
         transaction_cost: float = 0.001
     ):
-        """
-        Initialize portfolio optimizer
-        
-        Args:
-            returns: DataFrame of asset returns (time x assets)
-            optimization_method: SCIPY or CVXPY
-            half_life: Half-life in months for covariance computation
-            risk_free_rate: Risk-free rate for Sharpe ratio calculation
-            transaction_cost: Transaction cost rate
-        """
         self.returns = returns
         self.optimization_method = optimization_method
         self.risk_free_rate = risk_free_rate
@@ -464,7 +636,12 @@ class PortfolioOptimizer:
         
         # Compute exponentially weighted covariance matrix
         self.covariance = self._compute_ewm_covariance(half_life)
-        self.expected_returns = self._compute_expected_returns()
+        
+        # Use provided expected returns or compute from historical data
+        self.expected_returns = (
+            expected_returns if expected_returns is not None 
+            else self._compute_expected_returns()
+        )
         
         # Initialize portfolio objective functions
         self.objective_functions = PortfolioObjective()
@@ -508,6 +685,8 @@ class PortfolioOptimizer:
         
     def _compute_expected_returns(self) -> np.ndarray:
         """Compute expected returns using historical mean"""
+        ### Confidence 
+        
         return self.returns.mean().values
     
     def _get_objective_function(
@@ -926,51 +1105,59 @@ class PortfolioOptimizer:
             metrics['tracking_error'] = tracking_error
             
         return metrics
-
-class RobustPortfolioOptimizer(PortfolioOptimizer):
-    """Enhanced portfolio optimizer using Garlappi et al. (2007) robust optimization by default"""
     
+class RobustPortfolioOptimizer(PortfolioOptimizer):
     def __init__(
         self, 
-        returns: pd.DataFrame, 
-        epsilon: float = 0.1,
-        alpha: Union[float, np.ndarray] = 1.0,  # Can be scalar or vector
+        returns: pd.DataFrame,
+        expected_returns: Optional[pd.DataFrame] = None,
+        epsilon: Optional[pd.DataFrame] = None,
+        alpha: Optional[pd.DataFrame] = None,
         omega_method: str = 'bayes',
         optimization_method: OptimizationMethod = OptimizationMethod.SCIPY,
         half_life: int = 36,
-        risk_free_rate: float = 0.0,
-        transaction_cost: float = 0.001
+        risk_free_rate: float = 0.01,
+        transaction_cost: float = 0.001,
+        min_history: int = 24
     ):    
+        data_handler = PortfolioDataHandler(min_history=min_history)
         
-        # Store original returns and parameters
-        self.original_returns = returns.copy()
-        self.epsilon = epsilon
-        
-        # Handle alpha as vector or scalar
-        if isinstance(alpha, (int, float)):
-            self.alpha = np.full(returns.shape[1], alpha)
-        else:
-            if len(alpha) != returns.shape[1]:
-                raise ValueError(f"Alpha vector length ({len(alpha)}) must match number of assets ({returns.shape[1]})")
-            self.alpha = np.array(alpha)
+        if epsilon is None:
+            epsilon = pd.DataFrame(0.1, index=returns.index, columns=returns.columns)
+        if alpha is None:
+            alpha = pd.DataFrame(1.0, index=returns.index, columns=returns.columns)
             
-        self.omega_method = omega_method
-        self.half_life = half_life
-        
-        # Initialize parent with processed returns
-        super().__init__(
+        processed_data = data_handler.process_data(
             returns=returns,
+            expected_returns=expected_returns,
+            epsilon=epsilon,
+            alpha=alpha
+        )
+        
+        self.original_returns = returns.copy()
+        super().__init__(
+            returns=processed_data['returns'],
+            expected_returns=processed_data.get('expected_returns', None),
             optimization_method=optimization_method,
             half_life=half_life,
             risk_free_rate=risk_free_rate,
             transaction_cost=transaction_cost
         )
-                
-        # Calculate estimation error covariance (Omega)
-        self.omega = self._calculate_estimation_error_covariance(returns.values,
+        
+        self.epsilon = processed_data['epsilon']
+        self.alpha = processed_data['alpha']
+        self.correlation = processed_data['correlation']
+        self.statistics = processed_data['statistics']
+        self.rolling_vol = processed_data['rolling_vol']
+        
+        self.omega_method = omega_method
+        self.half_life = half_life
+        
+        self.omega = self._calculate_estimation_error_covariance(
+            processed_data['returns'].values,
             method=self.omega_method
         )
-    
+        
     def optimize(
         self, 
         objective: Optional[ObjectiveFunction] = None,
@@ -1141,135 +1328,159 @@ class RobustPortfolioOptimizer(PortfolioOptimizer):
         }
 
 class RobustEfficientFrontier(RobustPortfolioOptimizer):
-    """Class for computing Garlappi robust efficient frontier with asset-specific risk aversion"""
-    
-    def __init__(self, returns: pd.DataFrame, **kwargs):
-        super().__init__(returns, **kwargs)
-
+    def __init__(
+        self, 
+        returns: pd.DataFrame,
+        expected_returns: Optional[pd.DataFrame] = None,
+        epsilon: Optional[pd.DataFrame] = None,
+        alpha: Optional[pd.DataFrame] = None,
+        **kwargs
+    ):
+        super().__init__(
+            returns=returns,
+            expected_returns=expected_returns,
+            epsilon=epsilon,
+            alpha=alpha,
+            **kwargs
+        )
+        
     def compute_efficient_frontier(
-            self,
-            n_points: int = 15,
-            epsilon_range: Optional[Tuple[float, float]] = None,
-            risk_range: Optional[Tuple[float, float]] = None,
-            alpha_scale_range: Optional[Tuple[float, float]] = None,
-            constraints: Optional[OptimizationConstraints] = None
-        ) -> Dict[str, np.ndarray]:
-            """
-            Compute the Garlappi robust efficient frontier with improved numerical stability
-            """
-            print("Computing Garlappi robust efficient frontier...")
+        self,
+        n_points: int = 15,
+        epsilon_range: Optional[Union[Tuple[float, float], Dict[int, Tuple[float, float]]]] = None,
+        risk_range: Optional[Tuple[float, float]] = None,
+        alpha_scale_range: Optional[Tuple[float, float]] = None,
+        constraints: Optional[OptimizationConstraints] = None
+    ) -> Dict[str, np.ndarray]:
+        """
+        Fixed version of efficient frontier computation that properly handles tuple interpolation
+        """
+        if epsilon_range is None:
+            epsilon_range = (0.01, 0.5)
             
-            # Initialize base constraints if none provided
-            if constraints is None:
-                constraints = OptimizationConstraints(long_only=True)
+        # Convert tuples to floats for interpolation
+        if isinstance(epsilon_range, dict):
+            asset_specific_ranges = True
+            base_epsilon = self.epsilon.copy()
+        else:
+            asset_specific_ranges = False
+            epsilon_start, epsilon_end = map(float, epsilon_range)
             
-            # Initialize containers
-            frontier_results = {
-                'returns': np.zeros(n_points),
-                'risks': np.zeros(n_points),
-                'sharpe_ratios': np.zeros(n_points),
-                'weights': np.zeros((n_points, len(self.returns.columns))),
-                'epsilons': np.zeros(n_points),
-                'alpha_scales': np.zeros(n_points)
-            }
+        # Initialize results dictionary
+        frontier_results = {
+            'returns': np.zeros(n_points),
+            'risks': np.zeros(n_points),
+            'sharpe_ratios': np.zeros(n_points),
+            'weights': np.zeros((n_points, len(self.returns.columns))),
+            'epsilons': np.zeros((n_points, len(self.returns.columns))) if asset_specific_ranges 
+                       else np.zeros(n_points),
+            'alpha_scales': np.zeros(n_points)
+        }
+        
+        # Get risk bounds
+        if risk_range is None:
+            min_risk, max_risk = self._get_risk_bounds()
+        else:
+            min_risk, max_risk = map(float, risk_range)
             
-            # Compute minimum variance portfolio for lower bound
+        # Convert alpha scale range to floats
+        if alpha_scale_range is None:
+            alpha_start, alpha_end = 0.8, 1.2
+        else:
+            alpha_start, alpha_end = map(float, alpha_scale_range)
+        
+        valid_points = 0
+        max_attempts = n_points * 2
+        attempt = 0
+        
+        while valid_points < n_points and attempt < max_attempts:
             try:
-                min_var_result = self.optimize(
-                    objective=ObjectiveFunction.MINIMUM_VARIANCE,
-                    constraints=constraints
+                # Calculate interpolation ratio (as float)
+                ratio = float(valid_points) / float(max(1, n_points - 1))
+                
+                # Interpolate parameters using floating point arithmetic
+                target_risk = min_risk + (max_risk - min_risk) * ratio
+                
+                if asset_specific_ranges:
+                    # Handle asset-specific epsilon ranges
+                    current_epsilon = np.array([
+                        eps_range[0] + (eps_range[1] - eps_range[0]) * ratio
+                        for _, eps_range in epsilon_range.items()
+                    ])
+                else:
+                    # Single epsilon value
+                    current_epsilon = epsilon_start + (epsilon_end - epsilon_start) * ratio
+                    
+                # Interpolate alpha scale
+                current_alpha_scale = alpha_start + (alpha_end - alpha_start) * ratio
+                
+                # Scale alpha vector
+                scaled_alpha = self.alpha * current_alpha_scale
+                
+                # Create point-specific constraints
+                point_constraints = OptimizationConstraints(
+                    long_only=True,
+                    box_constraints={
+                        i: (0.0, min(1.0, float(constraints.box_constraints[i][1])) 
+                            if constraints and constraints.box_constraints 
+                            else (0.0, 1.0))
+                        for i in range(len(self.returns.columns))
+                    },
+                    target_risk=float(target_risk)  # Ensure float
                 )
-                min_risk = min_var_result['risk']
+                
+                # Add group constraints if they exist
+                if constraints and constraints.group_constraints:
+                    point_constraints.group_constraints = {
+                        k: GroupConstraint(
+                            assets=v.assets,
+                            bounds=(float(v.bounds[0]), float(v.bounds[1]))
+                        )
+                        for k, v in constraints.group_constraints.items()
+                    }
+                
+                # Optimize portfolio
+                result = self.optimize(
+                    objective=ObjectiveFunction.GARLAPPI_ROBUST,
+                    constraints=point_constraints,
+                    epsilon=current_epsilon,
+                    alpha=scaled_alpha,
+                    current_weights=None
+                )
+                
+                # Store results
+                frontier_results['returns'][valid_points] = result['return']
+                frontier_results['risks'][valid_points] = result['risk']
+                frontier_results['sharpe_ratios'][valid_points] = result['sharpe_ratio']
+                frontier_results['weights'][valid_points] = result['weights']
+                frontier_results['epsilons'][valid_points] = (
+                    current_epsilon if asset_specific_ranges else current_epsilon
+                )
+                frontier_results['alpha_scales'][valid_points] = current_alpha_scale
+                
+                valid_points += 1
+                print(f"Successfully computed point {valid_points}/{n_points}")
+                
             except Exception as e:
-                print(f"Failed to compute minimum variance portfolio: {e}")
-                min_risk = np.sqrt(np.min(np.diag(self.covariance)))
-            
-            # Compute maximum return portfolio for upper bound
-            try:
-                max_return_weights = np.zeros(len(self.returns.columns))
-                max_return_idx = np.argmax(self.expected_returns)
-                max_return_weights[max_return_idx] = 1.0
-                max_risk = np.sqrt(max_return_weights @ self.covariance @ max_return_weights)
-            except Exception as e:
-                print(f"Failed to compute maximum return portfolio: {e}")
-                max_risk = np.sqrt(np.max(np.diag(self.covariance)))
-            
-            # Set risk range with buffer
-            if risk_range is None:
-                risk_range = (min_risk * 0.9, max_risk * 1.1)
-            
-            # Set epsilon range
-            if epsilon_range is None:
-                epsilon_range = (0.01, 0.5)  # More conservative range
-            
-            # Set alpha scale range
-            if alpha_scale_range is None:
-                alpha_scale_range = (0.8, 1.2)  # More conservative range
-            
-            valid_points = 0
-            max_attempts = n_points * 2  # Allow for some failures
-            attempt = 0
-            
-            while valid_points < n_points and attempt < max_attempts:
-                try:
-                    # Interpolate parameters
-                    completion_ratio = valid_points / (n_points - 1) if n_points > 1 else 0
-                    target_risk = risk_range[0] + (risk_range[1] - risk_range[0]) * completion_ratio
-                    target_epsilon = epsilon_range[0] + (epsilon_range[1] - epsilon_range[0]) * completion_ratio
-                    alpha_scale = alpha_scale_range[0] + (alpha_scale_range[1] - alpha_scale_range[0]) * completion_ratio
-                    
-                    # Scale alpha vector
-                    scaled_alpha = self.alpha * alpha_scale
-                    
-                    # Add target risk to constraints with tolerance
-                    risk_tolerance = target_risk * 0.1  # 10% tolerance
-                    point_constraints = OptimizationConstraints(
-                        long_only=True,
-                        box_constraints={i: (0.0, 1.0) for i in range(len(self.returns.columns))},
-                        target_risk=target_risk
-                    )
-                    
-                    # Optimize portfolio with increased iterations and looser tolerance
-                    result = self.optimize(
-                        objective=ObjectiveFunction.GARLAPPI_ROBUST,
-                        constraints=point_constraints,
-                        epsilon=target_epsilon,
-                        alpha=scaled_alpha,
-                        current_weights=None,  # Start fresh each time
-                        options={'maxiter': 1000, 'ftol': 1e-6}
-                    )
-                    
-                    # Store results
-                    frontier_results['returns'][valid_points] = result['return']
-                    frontier_results['risks'][valid_points] = result['risk']
-                    frontier_results['sharpe_ratios'][valid_points] = result['sharpe_ratio']
-                    frontier_results['weights'][valid_points] = result['weights']
-                    frontier_results['epsilons'][valid_points] = target_epsilon
-                    frontier_results['alpha_scales'][valid_points] = alpha_scale
-                    
-                    valid_points += 1
-                    print(f"Successfully computed point {valid_points}/{n_points}")
-                    
-                except Exception as e:
-                    print(f"Failed attempt {attempt + 1}: {str(e)}")
-                    attempt += 1
-                    continue
-                    
+                print(f"Failed attempt {attempt + 1}: {str(e)}")
                 attempt += 1
-            
-            if valid_points == 0:
-                raise ValueError("Failed to compute any valid frontier points")
-            
-            # Trim results to valid points
-            for key in frontier_results:
-                frontier_results[key] = frontier_results[key][:valid_points]
-            
-            # Sort by risk
-            sort_idx = np.argsort(frontier_results['risks'])
-            for key in frontier_results:
-                frontier_results[key] = frontier_results[key][sort_idx]
-            
-            return frontier_results
+                continue
+                
+            attempt += 1
+        
+        if valid_points == 0:
+            raise ValueError("Failed to compute any valid frontier points")
+        
+        # Trim results to valid points
+        for key in frontier_results:
+            frontier_results[key] = frontier_results[key][:valid_points]
+        
+        # Sort by risk
+        sort_idx = np.argsort(frontier_results['risks'])
+        for key in frontier_results:
+            frontier_results[key] = frontier_results[key][sort_idx]
+        
+        return frontier_results
         
     def plot_frontier(self, frontier_results: Dict[str, np.ndarray]):
         """Create comprehensive Garlappi frontier visualization"""
@@ -1422,223 +1633,180 @@ class RobustEfficientFrontier(RobustPortfolioOptimizer):
             columns=[f'Asset_{i}' for i in range(n_assets)],
             index=[f'Point_{i}' for i in range(n_points)]
         )
-
-class RobustBacktestOptimizer(RobustPortfolioOptimizer):
-    """Enhanced class for performing vectorized backtesting of portfolio optimization strategies"""
     
+class RobustBacktestOptimizer(RobustPortfolioOptimizer):
     def __init__(
         self,
         returns: pd.DataFrame,
+        expected_returns: Optional[pd.DataFrame] = None,
+        epsilon: Optional[pd.DataFrame] = None,
+        alpha: Optional[pd.DataFrame] = None,
         lookback_window: int = 36,
         rebalance_frequency: int = 3,
         estimation_method: str = 'robust',
         transaction_cost: float = 0.001,
-        benchmark_returns: Optional[pd.Series] = None,
+        benchmark_returns: Optional[pd.DataFrame] = None,
         risk_free_rate: float = 0.0,
-        epsilon: float = 0.1,
+        epsilon_scaling: Optional[Dict[int, Callable]] = None,
+        min_history: int = 24,
+        out_of_sample: bool = False,
         **kwargs
     ):
-        """
-        Initialize backtester with simplified, robust design
+        data_handler = PortfolioDataHandler(min_history=min_history)
         
-        Args:
-            returns: DataFrame of asset returns (time x assets)
-            lookback_window: Number of periods for parameter estimation
-            rebalance_frequency: Number of periods between rebalances
-            estimation_method: 'robust' or 'standard'
-            transaction_cost: Transaction cost rate
-            benchmark_returns: Optional benchmark return series
-            risk_free_rate: Risk-free rate
-            epsilon: Uncertainty parameter for robust optimization
-            **kwargs: Additional parameters for parent class
-        """
-        # Initialize parent with full dataset
-        super().__init__(
+        if out_of_sample and expected_returns is not None:
+            expected_returns = expected_returns.shift(1).dropna()
+            returns = returns.loc[expected_returns.index]
+            
+            if epsilon is not None:
+                epsilon = epsilon.loc[expected_returns.index]
+            if alpha is not None:
+                alpha = alpha.loc[expected_returns.index]
+        
+        processed_data = data_handler.process_data(
             returns=returns,
+            expected_returns=expected_returns,
+            benchmark_returns=benchmark_returns,
             epsilon=epsilon,
+            alpha=alpha
+        )
+        
+        super().__init__(
+            returns=processed_data['returns'],
+            expected_returns=processed_data.get('expected_returns'),
+            epsilon=processed_data.get('epsilon'),
+            alpha=processed_data.get('alpha'),
             risk_free_rate=risk_free_rate,
             transaction_cost=transaction_cost,
+            min_history=min_history,
             **kwargs
         )
         
         self.lookback_window = lookback_window
         self.rebalance_frequency = rebalance_frequency
         self.estimation_method = estimation_method
-        self.benchmark_returns = benchmark_returns
+        self.benchmark_returns = processed_data.get('benchmark_returns')
+        self.epsilon = epsilon
+        self.out_of_sample = out_of_sample
+            
+    def run_backtest(
+        self,
+        objective: ObjectiveFunction,
+        constraints: OptimizationConstraints,
+        initial_weights: Optional[np.ndarray] = None,
+        **kwargs
+    ) -> Dict[str, Union[pd.Series, pd.DataFrame]]:
+        """Run backtest with processed data and proper validation"""
+        # Create data handler for each backtest window
+        data_handler = PortfolioDataHandler(min_history=self.lookback_window)
         
-        # Validation
-        if lookback_window >= len(returns):
-            raise ValueError("Lookback window must be shorter than returns history")
-            
-    def _estimate_parameters(self, historical_returns: pd.DataFrame) -> Dict[str, np.ndarray]:
-        """
-        Estimate parameters using selected method
+        # Initialize backtest components with processed data
+        returns = self.returns.copy()
+        dates = returns.index
+        n_assets = len(returns.columns)
         
-        Args:
-            historical_returns: Historical return data
-        """
-        if self.estimation_method == 'robust':
-            # Use median for returns and Ledoit-Wolf for covariance
-            mu = historical_returns.median()
-            
-            from sklearn.covariance import LedoitWolf
-            lw = LedoitWolf()
-            sigma = lw.fit(historical_returns).covariance_
-            
+        # Initialize weights
+        if initial_weights is None:
+            initial_weights = np.ones(n_assets) / n_assets
         else:
-            # Standard estimation
-            mu = historical_returns.mean()
-            sigma = historical_returns.cov()
+            initial_weights = np.asarray(initial_weights).flatten()
             
-        return {
-            'expected_returns': mu.values,
-            'covariance': sigma.values if isinstance(sigma, pd.DataFrame) else sigma
+        # Initialize result containers
+        portfolio_weights = pd.DataFrame(0.0, index=dates, columns=returns.columns)
+        portfolio_returns = pd.Series(0.0, index=dates)
+        realized_costs = pd.Series(0.0, index=dates)
+        optimization_metrics = pd.DataFrame(
+            0.0,
+            index=dates,
+            columns=['expected_return', 'expected_risk', 'sharpe_ratio']
+        )
+        epsilon_history = pd.DataFrame(
+            0.0,
+            index=dates,
+            columns=[f'epsilon_asset_{i}' for i in range(n_assets)]
+        )
+        
+        current_weights = initial_weights.copy()
+        
+        print("Running backtest...")
+        try:
+            for t in tqdm(range(self.lookback_window, len(dates))):
+                current_date = dates[t]
+                
+                if (t - self.lookback_window) % self.rebalance_frequency == 0:
+                    try:
+                        # Get and process historical data window
+                        historical_returns = returns.iloc[t-self.lookback_window:t]
+                        window_data = data_handler.process_data(historical_returns)
+                        self.epsilon                       
+                        
+                        ###################################
+                        
+                    ####
+                        # Record epsilon values
+                        epsilon_history.loc[current_date] = self.epsilon.loc[current_date]
+                        print(epsilon_history.loc[current_date])
+                        
+                        # Create optimizer with processed data
+                        temp_optimizer = RobustPortfolioOptimizer(
+                            returns=window_data['returns'],
+                            epsilon=self.epsilon.loc[current_date],
+                            risk_free_rate=self.risk_free_rate,
+                            transaction_cost=self.transaction_cost
+                        )
+                        
+                        # Optimize portfolio
+                        result = temp_optimizer.optimize(
+                            objective=objective,
+                            constraints=constraints,
+                            current_weights=current_weights,
+                            **kwargs
+                        )
+                        
+                        # Update and record results
+                        new_weights = result['weights']
+                        optimization_metrics.loc[current_date] = {
+                            'expected_return': result['return'],
+                            'expected_risk': result['risk'],
+                            'sharpe_ratio': result['sharpe_ratio']
+                        }
+                        
+                        costs = self.transaction_cost * np.sum(np.abs(new_weights - current_weights))
+                        realized_costs.loc[current_date] = costs
+                        current_weights = new_weights
+                        
+                    except Exception as e:
+                        print(f"Optimization failed at {current_date}: {str(e)}")
+                        
+                # Record weights and returns
+                portfolio_weights.loc[current_date] = current_weights
+                period_return = returns.loc[current_date]
+                portfolio_returns.loc[current_date] = (
+                    np.dot(period_return, current_weights) - 
+                    realized_costs.loc[current_date]
+                )
+                
+        except KeyboardInterrupt:
+            print("\nBacktest interrupted by user")
+            
+        # Clean up and validate results
+        results = {
+            'returns': portfolio_returns.to_frame('returns'),
+            'weights': portfolio_weights,
+            'metrics_history': optimization_metrics,
+            'realized_costs': realized_costs.to_frame('costs'),
+            'epsilon_history': epsilon_history
         }
         
-    def run_backtest(
-            self,
-            objective: ObjectiveFunction,
-            constraints: OptimizationConstraints,
-            initial_weights: Optional[np.ndarray] = None,
-            **kwargs
-        ) -> Dict[str, Union[pd.Series, pd.DataFrame]]:
-            """Run backtest with corrected array handling"""
-            # Convert returns index to timezone-naive datetime
-            returns = self.returns.copy()
-            returns.index = returns.index.tz_localize(None)
-            
-            dates = returns.index
-            n_assets = len(returns.columns)
-            
-            # Initialize weights properly as 1-d array
-            if initial_weights is None:
-                initial_weights = np.ones(n_assets) / n_assets
-            else:
-                initial_weights = np.asarray(initial_weights).flatten()
-                
-            # Initialize results containers
-            portfolio_weights = pd.DataFrame(
-                0.0, 
-                index=dates, 
-                columns=returns.columns,
-                dtype=np.float64
-            )
-            portfolio_returns = pd.Series(0.0, index=dates, dtype=np.float64)
-            realized_costs = pd.Series(0.0, index=dates, dtype=np.float64)
-            optimization_metrics = pd.DataFrame(
-                0.0,
-                index=dates,
-                columns=['expected_return', 'expected_risk', 'sharpe_ratio'],
-                dtype=np.float64
-            )
-            
-            current_weights = initial_weights.copy()
-            
-            print("Running backtest...")
-            try:
-                for t in tqdm(range(self.lookback_window, len(dates))):
-                    current_date = dates[t]
-                    
-                    # Determine if rebalancing is needed
-                    should_rebalance = (t - self.lookback_window) % self.rebalance_frequency == 0
-                    
-                    if should_rebalance:
-                        try:
-                            # Get historical data for estimation
-                            historical_returns = returns.iloc[t-self.lookback_window:t]
-                            
-                            # Ensure returns are properly formatted as 2-d numpy array
-                            if isinstance(historical_returns, pd.DataFrame):
-                                historical_returns_array = historical_returns.values
-                            else:
-                                historical_returns_array = np.atleast_2d(historical_returns)
-                                
-                            if len(historical_returns_array.shape) == 1:
-                                historical_returns_array = historical_returns_array.reshape(-1, 1)
-                            
-                            # Create temporary optimizer with proper array shapes
-                            temp_optimizer = RobustPortfolioOptimizer(
-                                returns=pd.DataFrame(
-                                    historical_returns_array,
-                                    index=historical_returns.index,
-                                    columns=returns.columns
-                                ),
-                                epsilon=self.epsilon,
-                                risk_free_rate=self.risk_free_rate,
-                                transaction_cost=self.transaction_cost
-                            )
-                            
-                            # Optimize portfolio with error handling
-                            try:
-                                result = temp_optimizer.optimize(
-                                    objective=objective,
-                                    constraints=constraints,
-                                    current_weights=current_weights.flatten(),  # Ensure 1-d
-                                    **kwargs
-                                )
-                                
-                                # Ensure weights are 1-d
-                                new_weights = np.asarray(result['weights']).flatten()
-                                
-                                # Record metrics
-                                optimization_metrics.loc[current_date] = {
-                                    'expected_return': float(result['return']),  # Ensure scalar
-                                    'expected_risk': float(result['risk']),     # Ensure scalar
-                                    'sharpe_ratio': float(result['sharpe_ratio']) # Ensure scalar
-                                }
-                                
-                                # Calculate and record costs
-                                costs = float(self.transaction_cost * np.sum(np.abs(new_weights - current_weights)))
-                                realized_costs.loc[current_date] = costs
-                                
-                                # Update weights
-                                current_weights = new_weights
-                                
-                            except Exception as e:
-                                print(f"Optimization failed at {current_date}: {str(e)}")
-                                # Keep current weights if optimization fails
-                        
-                        except Exception as e:
-                            print(f"Historical data processing failed at {current_date}: {str(e)}")
-                            continue
-                    
-                    # Record weights
-                    portfolio_weights.loc[current_date] = pd.Series(
-                        current_weights, 
-                        index=returns.columns
-                    )
-                    
-                    # Calculate realized return (ensure proper broadcasting)
-                    period_return = returns.loc[current_date].values.flatten()
-                    portfolio_returns.loc[current_date] = float(
-                        np.dot(period_return, current_weights) - 
-                        realized_costs.loc[current_date]
-                    )
-                    
-            except KeyboardInterrupt:
-                print("\nBacktest interrupted by user")
-                
-            # Clean up results
-            portfolio_returns = portfolio_returns.fillna(0)
-            portfolio_weights = portfolio_weights.fillna(method='ffill')
-            optimization_metrics = optimization_metrics.fillna(method='ffill')
-            realized_costs = realized_costs.fillna(0)
-            
-            # Calculate final metrics
-            metrics = self._calculate_backtest_metrics(
-                portfolio_returns=portfolio_returns,
-                portfolio_weights=portfolio_weights,
-                realized_costs=realized_costs
-            )
+        # Calculate final metrics with processed data
+        results['backtest_metrics'] = self._calculate_backtest_metrics(
+            portfolio_returns,
+            portfolio_weights,
+            realized_costs
+        )
         
-            return {
-                'returns': portfolio_returns.to_frame('returns'),
-                'weights': portfolio_weights,
-                'metrics_history': optimization_metrics,
-                'realized_costs': realized_costs.to_frame('costs'),
-                'backtest_metrics': pd.DataFrame.from_dict(metrics, orient='index', columns=['value'])
-            }
-
+        return results
+    
     def save_backtest_results(self, results: Dict[str, Union[pd.Series, pd.DataFrame]], 
                             filename: str):
         """Save backtest results to file with timezone handling"""
@@ -1654,6 +1822,23 @@ class RobustBacktestOptimizer(RobustPortfolioOptimizer):
         with pd.ExcelWriter(filename) as writer:
             for sheet_name, data in results_to_save.items():
                 data.to_excel(writer, sheet_name=sheet_name)
+    
+    def plot_epsilon_evolution(self, epsilon_history: pd.DataFrame):
+        """Plot the evolution of epsilon values over time"""
+        plt.figure(figsize=(12, 6))
+        
+        # Plot epsilon values for each asset
+        for column in epsilon_history.columns:
+            plt.plot(epsilon_history.index, epsilon_history[column], 
+                    label=column, alpha=0.7)
+        
+        plt.title('Evolution of Asset-Specific Uncertainty Parameters')
+        plt.xlabel('Date')
+        plt.ylabel('Epsilon Value')
+        plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left')
+        plt.grid(True)
+        plt.tight_layout()
+        plt.show()
         
     def _calculate_backtest_metrics(
         self,
@@ -1851,17 +2036,7 @@ class RobustBacktestOptimizer(RobustPortfolioOptimizer):
         ax.set_title('Cumulative Returns')
         ax.legend(loc='upper left')
         ax.grid(True)
-        
-    def _plot_parameter_stability(self, params: pd.DataFrame, ax: plt.Axes):
-        """Plot evolution of estimated parameters"""
-        if not params.empty:
-            # Normalize parameters for comparison
-            normalized_params = (params - params.mean()) / params.std()
-            normalized_params.plot(ax=ax)
-            ax.set_title('Parameter Stability (Normalized)')
-            ax.legend()
-            ax.grid(True)
-            
+                    
     def _plot_transaction_costs(self, costs: pd.Series, ax: plt.Axes):
         """Plot transaction costs analysis"""
         # Plot cumulative costs
